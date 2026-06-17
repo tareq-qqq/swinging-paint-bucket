@@ -163,7 +163,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 49ed6243185c252bd96037cea2157752, type: 3}
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::FluidSim3D
-  particleCount: 1500
+  particleCount: 2000
   particleSpacing: 0.25
   spawnCentre: {x: 0, y: 1.5, z: 0}
   spawnJitter: 0.02
