@@ -130,12 +130,12 @@ GameObject:
   - component: {fileID: 492431542}
   - component: {fileID: 492431543}
   m_Layer: 0
-  m_Name: GameObject
+  m_Name: CpuObject
   m_TagString: Untagged
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!4 &492431542
 Transform:
   m_ObjectHideFlags: 0
@@ -175,6 +175,16 @@ MonoBehaviour:
   autoCalibrateRestDensity: 1
   gravity: {x: 0, y: -10, z: 0}
   collisionDamping: 0.45
+  ambientTemperature: 0
+  humidity: 0.5
+  tempViscosityFactor: 0.03
+  enableDrying: 1
+  dryingRate: 0.05
+  setWetnessThreshold: 0.15
+  airExposureThreshold: 0.85
+  enableAirEffects: 1
+  windForce: {x: 0, y: 0, z: 0}
+  airDrag: 0.5
   boundsSize: {x: 4, y: 4, z: 4}
   iterationsPerFrame: 2
   paintColor: {r: 1, g: 0, b: 0.11764717, a: 1}
@@ -361,8 +371,69 @@ Transform:
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 963194225}
   serializedVersion: 2
+  m_LocalRotation: {x: 0.13686372, y: -0, z: -0, w: 0.99058986}
+  m_LocalPosition: {x: 0, y: 1.8, z: -14.18}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+  m_ConstrainProportionsScale: 0
+  m_Children: []
+  m_Father: {fileID: 0}
+  m_LocalEulerAnglesHint: {x: 15.733, y: 0, z: 0}
+--- !u!1 &1304441043
+GameObject:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  serializedVersion: 6
+  m_Component:
+  - component: {fileID: 1304441045}
+  - component: {fileID: 1304441044}
+  m_Layer: 0
+  m_Name: GPUObject
+  m_TagString: Untagged
+  m_Icon: {fileID: 0}
+  m_NavMeshLayer: 0
+  m_StaticEditorFlags: 0
+  m_IsActive: 1
+--- !u!114 &1304441044
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1304441043}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 0f1b3ac005550bbf5a71aa47ddce2e56, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: Assembly-CSharp::FluidSimGPU
+  compute: {fileID: 7200000, guid: 2cae5998d5ba258b4af2a584fcfdd619, type: 3}
+  particleCount: 30000
+  particleSpacing: 0.25
+  spawnCentre: {x: 0, y: 1.5, z: 0}
+  spawnJitter: 0.02
+  smoothingRadius: 0.5
+  restDensity: 12
+  pressureMultiplier: 200
+  nearPressureMultiplier: 12
+  viscosityStrength: 0.12
+  autoCalibrateRestDensity: 1
+  gravity: {x: 0, y: -10, z: 0}
+  collisionDamping: 0.45
+  boundsSize: {x: 10, y: 10, z: 10}
+  iterationsPerFrame: 1
+  paintColor: {r: 0.2, g: 0.55, b: 1, a: 1}
+  particleScale: 0.2
+--- !u!4 &1304441045
+Transform:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1304441043}
+  serializedVersion: 2
   m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: 0, y: 1, z: -10}
+  m_LocalPosition: {x: 0.87977, y: 0, z: -0.85214}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
   m_Children: []
@@ -375,3 +446,4 @@ SceneRoots:
   - {fileID: 963194228}
   - {fileID: 705507995}
   - {fileID: 492431542}
+  - {fileID: 1304441045}
