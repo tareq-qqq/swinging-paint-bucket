@@ -71,6 +71,52 @@ public class FluidSim3D : MonoBehaviour
     [Range(0f, 1f)]
     public float collisionDamping = 0.45f;
 
+    [Header("Environment — Temperature & Humidity (PDF factors)")]
+    [Tooltip(
+        "Ambient air temperature in Celsius. Warmer paint is thinner (lower viscosity) and dries faster."
+    )]
+    public float ambientTemperature = 20f;
+
+    [Tooltip("Air humidity 0..1. Humid air dries the paint slowly; dry air dries it fast.")]
+    [Range(0f, 1f)]
+    public float humidity = 0.5f;
+
+    [Tooltip(
+        "How strongly temperature thins/thickens the paint. 0 = temperature ignored for viscosity."
+    )]
+    public float tempViscosityFactor = 0.03f;
+
+    [Header("Environment — Drying / Curing")]
+    [Tooltip("Turn the whole drying/curing feature on or off.")]
+    public bool enableDrying = true;
+
+    [Tooltip("Base curing speed (per second) for fully air-exposed paint in hot, dry air.")]
+    public float dryingRate = 0.05f;
+
+    [Tooltip(
+        "Below this wetness (0..1) the paint has 'set' and its motion is frozen — the canvas-sticking hook."
+    )]
+    [Range(0f, 1f)]
+    public float setWetnessThreshold = 0.15f;
+
+    [Tooltip(
+        "Density fraction (of restDensity) above which a particle counts as bulk (shielded from air), not surface."
+    )]
+    [Range(0f, 1f)]
+    public float airExposureThreshold = 0.85f;
+
+    [Header("Environment — Air motion (only affects air-exposed paint)")]
+    [Tooltip("Turn wind + air drag on or off.")]
+    public bool enableAirEffects = true;
+
+    [Tooltip(
+        "Constant wind force (world space). Only pushes surface/airborne paint, not the bulk."
+    )]
+    public Vector3 windForce = Vector3.zero;
+
+    [Tooltip("Air resistance (per second) on exposed paint. 0 = none.")]
+    public float airDrag = 0.5f;
+
     [Header("Bounds (the container — move/rotate this GameObject to slosh the fluid)")]
     [Tooltip("Width/height/depth of the box the fluid is trapped in, centred on this GameObject.")]
     public Vector3 boundsSize = new Vector3(8f, 8f, 8f);
@@ -95,6 +141,7 @@ public class FluidSim3D : MonoBehaviour
     float[] densities; // standard density at each particle
     float[] nearDensities; // "near" density (sharper kernel) for anti-clumping
     Vector3[] velocityBuffer; // snapshot of velocities so viscosity can run in parallel safely
+    float[] wetness; // 1 = fully wet, 0 = cured/set. Driven by temperature + humidity + air exposure.
 
     int numParticles; // actual allocated count
 
@@ -106,6 +153,9 @@ public class FluidSim3D : MonoBehaviour
         nearDensityScale,
         nearDensityDerivScale,
         viscScale;
+
+    // Temperature-adjusted viscosity for the current step (set in ApplyViscosity).
+    float effectiveViscosity;
 
     // ---------------------------------------------------------------------------------
     //  Spatial hash — sorted-array scheme (no Dictionary, no per-frame GC).
@@ -195,6 +245,7 @@ public class FluidSim3D : MonoBehaviour
         velocityBuffer = new Vector3[numParticles];
         densities = new float[numParticles];
         nearDensities = new float[numParticles];
+        wetness = new float[numParticles];
 
         spatialEntries = new SpatialEntry[numParticles];
         cellStart = new int[numParticles];
@@ -231,6 +282,7 @@ public class FluidSim3D : MonoBehaviour
             Vector3 jitter = UnityEngine.Random.insideUnitSphere * spawnJitter;
             positions[i] = spawnCentre - Vector3.one * blockExtent + cell + jitter;
             velocities[i] = Vector3.zero;
+            wetness[i] = 1f; // fully wet to start
         }
     }
 
@@ -253,6 +305,7 @@ public class FluidSim3D : MonoBehaviour
         ApplyGravityAndPredict(dt); // 1. external forces + look-ahead positions
         UpdateSpatialHash(); // 2. rebuild neighbour grid on predicted positions
         ComputeDensities(); // 3. density + near-density
+        ApplyEnvironment(dt); // 3b. temperature/humidity drying + air drag/wind (needs density)
         ApplyPressureForces(dt); // 4. pressure pushes from dense to sparse regions
         ApplyViscosity(dt); // 5. velocity smoothing (paint thickness)
         IntegrateAndResolveCollisions(dt); // 6. move + bounce off walls
@@ -267,6 +320,58 @@ public class FluidSim3D : MonoBehaviour
             velocities[i] += gravity * dt;
             predictedPositions[i] = positions[i] + velocities[i] * dt;
         }
+    }
+
+    // 3b. Temperature/humidity environment effects (PDF factors). Runs AFTER ComputeDensities
+    //     because it needs density to tell air-exposed paint (surface/airborne) from bulk paint.
+    //
+    //     Drying and air motion are SURFACE phenomena: they act only where paint meets air. We
+    //     detect that from density — interior particles are packed (high density), surface ones are
+    //     missing neighbours on the air side (low density). So:
+    //       - bulk paint inside the fluid/bucket does NOT dry and is NOT blown by wind  (exposure≈0)
+    //       - a thin spread is mostly surface so it dries fast; a deep pool stays wet     (volume effect, free)
+    //     Temperature->viscosity is handled globally in ApplyViscosity (heat conducts through bulk).
+    void ApplyEnvironment(float dt)
+    {
+        if (!enableDrying && !enableAirEffects)
+            return;
+
+        // Warmer air dries paint faster; at/below 0°C essentially no drying. Dry air dries faster.
+        float tempDryFactor = Mathf.Clamp01(ambientTemperature / 40f);
+        float bulkDensity = airExposureThreshold * restDensity;
+
+        Parallel.For(
+            0,
+            numParticles,
+            i =>
+            {
+                // Air-exposure from density: 0 = buried in bulk (>= bulkDensity), 1 = airborne droplet.
+                float exposure =
+                    bulkDensity > 0f
+                        ? Mathf.Clamp01((bulkDensity - densities[i]) / bulkDensity)
+                        : 0f;
+
+                if (enableDrying)
+                {
+                    // Surface-gated curing. Bulk paint (exposure 0) keeps its wetness.
+                    wetness[i] = Mathf.Max(
+                        0f,
+                        wetness[i] - dryingRate * tempDryFactor * (1f - humidity) * exposure * dt
+                    );
+
+                    // Once "set", freeze the paint's motion (the future canvas-sticking hook).
+                    // dampens the velocity to zero over a few frames instead of snapping it instantly
+                    if (wetness[i] <= setWetnessThreshold)
+                        velocities[i] *= Mathf.Max(0f, 1f - 20f * dt);
+                }
+
+                if (enableAirEffects && exposure > 0f)
+                {
+                    velocities[i] += windForce * (exposure * dt); // wind pushes exposed paint
+                    velocities[i] -= velocities[i] * (airDrag * exposure * dt); // air resistance
+                }
+            }
+        );
     }
 
     // 3. Accumulate density and near-density for every particle from its neighbours.
@@ -362,13 +467,23 @@ public class FluidSim3D : MonoBehaviour
     //    This is what makes thick paint move as a cohesive blob instead of splashing.
     void ApplyViscosity(float dt)
     {
-        if (viscosityStrength <= 0f)
+        // Temperature thins/thickens ALL the paint (heat conducts through the bulk), so this is a
+        // global multiplier on the viscosity, recomputed each step for live tuning.
+        effectiveViscosity = viscosityStrength * TemperatureViscosityMultiplier();
+        if (effectiveViscosity <= 0f)
             return;
 
         // Snapshot velocities so parallel workers read a stable copy of neighbours' velocities
         // (otherwise reading velocities[j] while another thread writes it would be a data race).
         Array.Copy(velocities, velocityBuffer, numParticles);
         Parallel.For(0, numParticles, i => ComputeViscosityForce(i, dt));
+    }
+
+    // Warmer paint is thinner, colder is thicker. 1.0 at the 20°C reference; clamped so it can
+    // never go negative. tempViscosityFactor = 0 disables the effect.
+    float TemperatureViscosityMultiplier()
+    {
+        return Mathf.Max(0.05f, 1f - tempViscosityFactor * (ambientTemperature - 20f));
     }
 
     void ComputeViscosityForce(int i, float dt)
@@ -396,7 +511,7 @@ public class FluidSim3D : MonoBehaviour
             }
         }
 
-        velocities[i] += viscForce * (viscosityStrength * dt);
+        velocities[i] += viscForce * (effectiveViscosity * dt);
     }
 
     // 6. Move particles and keep them inside the box. The clamp is done in the box's LOCAL
