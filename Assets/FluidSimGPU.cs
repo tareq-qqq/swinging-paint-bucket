@@ -84,8 +84,36 @@ public class FluidSimGPU : MonoBehaviour
     )]
     public float minStableFramerate = 30f;
 
+    [Header("Color mixing (2 paints)")]
+    public bool enableColorMixing = true;
+
+    [Tooltip(
+        "Paint A — pick ANY colour from the wheel. It is converted to a reflectance spectrum and mixed subtractively via Kubelka-Munk, so e.g. blue + yellow = green (not grey)."
+    )]
+    [ColorUsage(false)]
+    public Color paintColorA = new Color(0.10f, 0.20f, 0.85f); // blue (left half of the spawn block)
+
+    [Tooltip("Paint B — pick ANY colour from the wheel (subtractive Kubelka-Munk mixing).")]
+    [ColorUsage(false)]
+    public Color paintColorB = new Color(0.95f, 0.85f, 0.10f); // yellow (right half)
+
+    [Range(0f, 1.5f)]
+    [Tooltip(
+        "Extra saturation for MIXED colours (real subtractive mixes are muted; this makes secondaries like green/orange punchier). 0 = physically honest, higher = more vivid. Pure picked paints are unaffected."
+    )]
+    public float mixVibrance = 0.45f;
+
+    [Tooltip(
+        "Overall pigment mixing speed (fraction toward the neighbour-average color per second)."
+    )]
+    public float colorMixRate = 1f;
+
+    [Tooltip(
+        "How much 'moving against each other' (head-on) speeds mixing up vs parallel/shear motion."
+    )]
+    public float shakeMixBoost = 0.5f;
+
     [Header("Rendering")]
-    public Color paintColor = new Color(0.2f, 0.55f, 1f);
     public float particleScale = 0.2f;
 
     // --- GPU buffers ---
@@ -94,6 +122,11 @@ public class FluidSimGPU : MonoBehaviour
         velocitiesBuf; // float3
     ComputeBuffer densitiesBuf; // float2
     ComputeBuffer wetnessBuf; // float (1 = wet, 0 = cured)
+    ComputeBuffer colorsBuf; // float3: .x = mix fraction t (0=paint A, 1=paint B)
+    ComputeBuffer mixLutBuf; // float3 LUT: t -> displayed colour (spectral Kubelka-Munk)
+    const int MixLutSize = 64;
+    Color lutColorA,
+        lutColorB; // last colours the LUT was built for (rebuild on change)
     ComputeBuffer spatialKeysBuf,
         spatialIndicesBuf; // uint, padded to pow2
     ComputeBuffer cellStartBuf; // uint, size numParticles
@@ -107,6 +140,7 @@ public class FluidSimGPU : MonoBehaviour
         kEnvironment,
         kPressure,
         kViscosity,
+        kMixColors,
         kUpdatePositions;
 
     int numParticles;
@@ -157,6 +191,10 @@ public class FluidSimGPU : MonoBehaviour
                 SimulationStep(dt);
         }
 
+        // Live inspector tuning: rebuild the t -> colour LUT only when a paint colour changes.
+        if (mixLutBuf != null && (paintColorA != lutColorA || paintColorB != lutColorB))
+            BuildMixLut();
+
         RenderParticles();
     }
 
@@ -182,6 +220,7 @@ public class FluidSimGPU : MonoBehaviour
         kEnvironment = compute.FindKernel("Environment");
         kPressure = compute.FindKernel("CalculatePressureForce");
         kViscosity = compute.FindKernel("CalculateViscosity");
+        kMixColors = compute.FindKernel("MixColors");
         kUpdatePositions = compute.FindKernel("UpdatePositions");
     }
 
@@ -195,6 +234,7 @@ public class FluidSimGPU : MonoBehaviour
         velocitiesBuf = new ComputeBuffer(numParticles, sizeof(float) * 3);
         densitiesBuf = new ComputeBuffer(numParticles, sizeof(float) * 2);
         wetnessBuf = new ComputeBuffer(numParticles, sizeof(float));
+        colorsBuf = new ComputeBuffer(numParticles, sizeof(float) * 3);
         spatialKeysBuf = new ComputeBuffer(paddedCount, sizeof(uint));
         spatialIndicesBuf = new ComputeBuffer(paddedCount, sizeof(uint));
         cellStartBuf = new ComputeBuffer(numParticles, sizeof(uint));
@@ -208,10 +248,23 @@ public class FluidSimGPU : MonoBehaviour
         predictedBuf.SetData(positions); // predicted = positions until the first step
         velocitiesBuf.SetData(velocities);
 
+        // The per-particle colour buffer stores a single MIX FRACTION t in .x (0 = paint A,
+        // 1 = paint B); .y/.z are unused. The diffusion kernel averages this scalar, and the
+        // shader maps t -> displayed colour through the spectral Kubelka-Munk LUT (see BuildMixLut).
+        // Storing t (not RGB) keeps mixing in spectral space with exact, vivid endpoint colours.
         var wet = new float[numParticles];
+        var colors = new Vector3[numParticles];
         for (int i = 0; i < numParticles; i++)
+        {
             wet[i] = 1f; // fully wet to start
+            // Two paints: left half of the spawn block = A (t=0), right half = B (t=1).
+            float t = positions[i].x < spawnCentre.x ? 0f : 1f;
+            colors[i] = new Vector3(t, 0f, 0f);
+        }
         wetnessBuf.SetData(wet);
+        colorsBuf.SetData(colors);
+
+        BuildMixLut();
     }
 
     void SpawnInGrid(Vector3[] positions, Vector3[] velocities)
@@ -279,6 +332,15 @@ public class FluidSimGPU : MonoBehaviour
         compute.SetBuffer(kViscosity, "SpatialIndices", spatialIndicesBuf);
         compute.SetBuffer(kViscosity, "CellStart", cellStartBuf);
 
+        // MixColors
+        compute.SetBuffer(kMixColors, "PredictedPositions", predictedBuf);
+        compute.SetBuffer(kMixColors, "Velocities", velocitiesBuf);
+        compute.SetBuffer(kMixColors, "Colors", colorsBuf);
+        compute.SetBuffer(kMixColors, "Wetness", wetnessBuf);
+        compute.SetBuffer(kMixColors, "SpatialKeys", spatialKeysBuf);
+        compute.SetBuffer(kMixColors, "SpatialIndices", spatialIndicesBuf);
+        compute.SetBuffer(kMixColors, "CellStart", cellStartBuf);
+
         // UpdatePositions
         compute.SetBuffer(kUpdatePositions, "Positions", positionsBuf);
         compute.SetBuffer(kUpdatePositions, "Velocities", velocitiesBuf);
@@ -300,6 +362,8 @@ public class FluidSimGPU : MonoBehaviour
             Dispatch(kEnvironment, numParticles);
         Dispatch(kPressure, numParticles);
         Dispatch(kViscosity, numParticles);
+        if (enableColorMixing)
+            Dispatch(kMixColors, numParticles);
         Dispatch(kUpdatePositions, numParticles);
     }
 
@@ -334,6 +398,9 @@ public class FluidSimGPU : MonoBehaviour
         compute.SetFloat("airExposureThreshold", airExposureThreshold);
         compute.SetVector("windForce", windForce);
         compute.SetFloat("airDrag", airDrag);
+
+        compute.SetFloat("colorMixRate", colorMixRate);
+        compute.SetFloat("shakeMixBoost", shakeMixBoost);
 
         compute.SetFloat("densityScale", 15f / (2f * Mathf.PI * r5));
         compute.SetFloat("densityDerivScale", 15f / (Mathf.PI * r5));
@@ -401,6 +468,149 @@ public class FluidSimGPU : MonoBehaviour
     }
 
     // =================================================================================
+    //  Spectral colour — pick ANY two colours; mix them like real PAINT (subtractive),
+    //  so blue + yellow = green, not the grey that averaging RGB gives.
+    //
+    //  Light mixes additively (RGB), but pigments mix SUBTRACTIVELY: each absorbs part of
+    //  the spectrum and the absorptions stack. Real paint also needs a *spectrum* (not 3
+    //  numbers): a blue pigment reflects some green, so blue+yellow keeps green and drops
+    //  red/blue. We model this with single-constant Kubelka-Munk over SPECTRAL_BANDS bands:
+    //
+    //    1. Turn each picked colour into a reflectance spectrum R(λ)  (ColorToSpectrum).
+    //    2. Per band, K/S = (1-R)^2 / (2R)  — the absorption/scatter ratio; it is LINEAR in
+    //       pigment amount, so a 50/50 mix is just the average of the two K/S spectra.
+    //    3. Mix: KS(t) = lerp(KS_A, KS_B, t); invert back to reflectance, then -> RGB.
+    //
+    //  Because the whole thing is a function of ONE number t (the mix fraction the particles
+    //  carry and diffuse), we bake it once into a small t -> colour LUT on the CPU; the shader
+    //  just samples the LUT. No per-frame spectral maths on the GPU, and easy to verify here.
+    //  Endpoints are pinned EXACTLY to the picked colours (so pures stay vivid); only the blend
+    //  in between follows the spectral curve.  No library — this is a few lines of KM physics.
+    // =================================================================================
+    const int SPECTRAL_BANDS = 20; // ~400..680 nm, CPU-only cost (LUT is precomputed)
+
+    static float SmoothStep01(float a, float b, float x)
+    {
+        float t = Mathf.Clamp01((x - a) / (b - a));
+        return t * t * (3f - 2f * t);
+    }
+
+    // Per-band reflectance "weights" for the red/green/blue content of a colour. Asymmetric on
+    // purpose: blue reflects into green (overlap -> green survives a blue+yellow mix), but green
+    // and red stay ~0 in the blue region (so yellow does NOT reflect blue).
+    static void BandWeights(float wl, out float wR, out float wG, out float wB)
+    {
+        wB = Mathf.Lerp(1f, 0.40f, SmoothStep01(450f, 540f, wl)); // 1 in blue -> 0.4 in green
+        wB = Mathf.Lerp(wB, 0.05f, SmoothStep01(540f, 610f, wl)); // 0.4 -> 0.05 into red
+        wG = SmoothStep01(470f, 540f, wl) * (1f - 0.85f * SmoothStep01(580f, 660f, wl));
+        wR = SmoothStep01(540f, 620f, wl);
+    }
+
+    static float BandWavelength(int b) => 400f + (680f - 400f) * b / (SPECTRAL_BANDS - 1);
+
+    // sRGB colour -> reflectance spectrum (linear-light weighted sum of the band weights).
+    static void ColorToSpectrum(Color c, float[] spectrum)
+    {
+        Color lin = c.linear;
+        for (int b = 0; b < SPECTRAL_BANDS; b++)
+        {
+            BandWeights(BandWavelength(b), out float wR, out float wG, out float wB);
+            float s = 0.02f + lin.r * wR + lin.g * wG + lin.b * wB; // 0.02 baseline keeps R>0
+            spectrum[b] = Mathf.Clamp(s, 0.02f, 0.98f);
+        }
+    }
+
+    // Reflectance spectrum -> linear RGB (band weights double as colour-matching sensitivities,
+    // normalised so a flat reflectance of 1 maps to white).
+    static Vector3 SpectrumToLinearRgb(float[] spectrum)
+    {
+        float r = 0f,
+            g = 0f,
+            b = 0f,
+            nr = 0f,
+            ng = 0f,
+            nb = 0f;
+        for (int i = 0; i < SPECTRAL_BANDS; i++)
+        {
+            BandWeights(BandWavelength(i), out float wR, out float wG, out float wB);
+            r += spectrum[i] * wR;
+            g += spectrum[i] * wG;
+            b += spectrum[i] * wB;
+            nr += wR;
+            ng += wG;
+            nb += wB;
+        }
+        return new Vector3(r / nr, g / ng, b / nb);
+    }
+
+    static float ReflectanceToKS(float r)
+    {
+        float v = 1f - r;
+        return v * v / (2f * r);
+    }
+
+    static float KSToReflectance(float ks)
+    {
+        return 1f + ks - Mathf.Sqrt(ks * ks + 2f * ks);
+    }
+
+    // Bake the t -> displayed-colour LUT for the current paintColorA/paintColorB.
+    void BuildMixLut()
+    {
+        if (mixLutBuf == null)
+            mixLutBuf = new ComputeBuffer(MixLutSize, sizeof(float) * 3);
+
+        var specA = new float[SPECTRAL_BANDS];
+        var specB = new float[SPECTRAL_BANDS];
+        ColorToSpectrum(paintColorA, specA);
+        ColorToSpectrum(paintColorB, specB);
+
+        var ksA = new float[SPECTRAL_BANDS];
+        var ksB = new float[SPECTRAL_BANDS];
+        for (int b = 0; b < SPECTRAL_BANDS; b++)
+        {
+            ksA[b] = ReflectanceToKS(specA[b]);
+            ksB[b] = ReflectanceToKS(specB[b]);
+        }
+
+        // Spectral renders of the two endpoints, and the picked colours in linear light — the
+        // difference is the per-endpoint correction that pins t=0/t=1 to the EXACT picked colour.
+        Vector3 specRgbA = SpectrumToLinearRgb(specA);
+        Vector3 specRgbB = SpectrumToLinearRgb(specB);
+        Color linA = paintColorA.linear,
+            linB = paintColorB.linear;
+        Vector3 corrA = new Vector3(linA.r - specRgbA.x, linA.g - specRgbA.y, linA.b - specRgbA.z);
+        Vector3 corrB = new Vector3(linB.r - specRgbB.x, linB.g - specRgbB.y, linB.b - specRgbB.z);
+
+        var lut = new Vector3[MixLutSize];
+        var ksMix = new float[SPECTRAL_BANDS];
+        for (int k = 0; k < MixLutSize; k++)
+        {
+            float t = k / (float)(MixLutSize - 1);
+            for (int b = 0; b < SPECTRAL_BANDS; b++)
+                ksMix[b] = KSToReflectance(Mathf.Lerp(ksA[b], ksB[b], t)); // K/S mix -> reflectance
+            Vector3 rgb = SpectrumToLinearRgb(ksMix);
+            rgb += corrA * (1f - t) + corrB * t; // pin endpoints exactly to the picked colours
+
+            // Optional vividness for the MIX only: push away from grey, faded out to 0 at the two
+            // endpoints (1 - |2t-1|) so the picked pure paints are never altered.
+            float boost = mixVibrance * (1f - Mathf.Abs(2f * t - 1f));
+            if (boost > 0f)
+            {
+                float luma = 0.299f * rgb.x + 0.587f * rgb.y + 0.114f * rgb.z;
+                rgb =
+                    new Vector3(luma, luma, luma)
+                    + (rgb - new Vector3(luma, luma, luma)) * (1f + boost);
+            }
+            lut[k] = new Vector3(Mathf.Clamp01(rgb.x), Mathf.Clamp01(rgb.y), Mathf.Clamp01(rgb.z));
+        }
+
+        mixLutBuf.SetData(lut);
+        lutColorA = paintColorA;
+        lutColorB = paintColorB;
+    }
+
+    // =================================================================================
     //  Rendering — draw instances reading position from the GPU buffer (no readback)
     // =================================================================================
     void BuildRenderResources()
@@ -418,8 +628,10 @@ public class FluidSimGPU : MonoBehaviour
             return;
 
         particleMaterial.SetBuffer("Positions", positionsBuf);
+        particleMaterial.SetBuffer("Colors", colorsBuf); // .x = per-particle mix fraction t
+        particleMaterial.SetBuffer("MixLut", mixLutBuf); // t -> spectral Kubelka-Munk colour
+        particleMaterial.SetInt("MixLutSize", MixLutSize);
         particleMaterial.SetFloat("_Scale", particleScale);
-        particleMaterial.SetColor("_Color", paintColor);
 
         var rp = new RenderParams(particleMaterial) { worldBounds = drawBounds };
         Graphics.RenderMeshPrimitives(rp, particleMesh, 0, numParticles);
@@ -486,6 +698,9 @@ public class FluidSimGPU : MonoBehaviour
         velocitiesBuf?.Release();
         densitiesBuf?.Release();
         wetnessBuf?.Release();
+        colorsBuf?.Release();
+        mixLutBuf?.Release();
+        mixLutBuf = null;
         spatialKeysBuf?.Release();
         spatialIndicesBuf?.Release();
         cellStartBuf?.Release();

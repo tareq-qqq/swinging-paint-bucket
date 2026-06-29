@@ -16,6 +16,7 @@
 #pragma kernel Environment
 #pragma kernel CalculatePressureForce
 #pragma kernel CalculateViscosity
+#pragma kernel MixColors
 #pragma kernel UpdatePositions
 
 // ---------------------------------------------------------------------------------
@@ -26,6 +27,7 @@ RWStructuredBuffer<float3> PredictedPositions;
 RWStructuredBuffer<float3> Velocities;
 RWStructuredBuffer<float2> Densities;       // x = density, y = near-density
 RWStructuredBuffer<float> Wetness;          // 1 = wet, 0 = cured (temperature/humidity/exposure)
+RWStructuredBuffer<float3> Colors;          // per-particle pigment RGB (two paints, blended by MixColors)
 
 // Spatial hash (sorted by cell key). Sized to a power of two for the bitonic sort;
 // padded entries carry key 0xFFFFFFFF so they sort to the end and are ignored.
@@ -58,6 +60,10 @@ float setWetnessThreshold;
 float airExposureThreshold;
 float3 windForce;
 float airDrag;
+
+// Colour mixing.
+float colorMixRate;     // overall mixing speed
+float shakeMixBoost;    // how much "moving against each other" speeds up mixing
 
 // Kernel normalisation constants (3D), precomputed on the CPU.
 float densityScale;
@@ -360,6 +366,76 @@ void CalculateViscosity(uint3 id : SV_DispatchThreadID)
     }
 
     Velocities[i] += viscForce * (effectiveViscosity * deltaTime);
+}
+
+// =================================================================================
+//  7b. Colour mixing — pigment diffuses between neighbours. Mixing is strong when
+//      particles move AGAINST each other (relative motion along the line connecting
+//      them) and weak for parallel/shear motion; curing/dry paint (low wetness)
+//      resists mixing. Diffusion -> local average -> irreversible blend. See ColorMixing.md.
+//      (Reads neighbours' Colors while writing own — benign relaxation race, like viscosity.)
+// =================================================================================
+[numthreads(64, 1, 1)]
+void MixColors(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= numParticles) return;
+    uint i = id.x;
+
+    // Colors[i].x is this paint's MIX FRACTION t (0 = paint A, 1 = paint B); .y/.z are unused.
+    // Diffusing t (averaging toward neighbours) is the mixing; the displayed colour comes from a
+    // CPU-baked spectral Kubelka-Munk LUT keyed by t (see FluidSimGPU.BuildMixLut). Averaging this
+    // scalar keeps the blend in subtractive paint space, so blue + yellow tends to green, not grey.
+    float3 pos = PredictedPositions[i];
+    float3 velI = Velocities[i];
+    float3 colI = Colors[i];
+    int3 centre = CellCoord(pos);
+
+    // Weighted neighbour colour average + how "agitated" (head-on relative motion) the neighbourhood
+    // is. Normalising by the weight sum keeps this a true average -> the update can never overshoot.
+    float3 colourSum = 0;
+    float weightSum = 0;
+    float agitationSum = 0;
+
+    for (int ox = -1; ox <= 1; ox++)
+    for (int oy = -1; oy <= 1; oy++)
+    for (int oz = -1; oz <= 1; oz++)
+    {
+        uint key = KeyFromHash(HashCell(centre + int3(ox, oy, oz)));
+        uint start = CellStart[key];
+        if (start == INVALID) continue;
+
+        for (uint s = start; s < numParticles; s++)
+        {
+            if (SpatialKeys[s] != key) break;
+            uint j = SpatialIndices[s];
+            if (j == i) continue;
+
+            float3 d = pos - PredictedPositions[j];
+            float sqr = dot(d, d);
+            if (sqr >= radiusSq) continue;
+            float dst = sqrt(sqr);
+
+            // Relative motion ALONG the line between them: high head-on, ~0 parallel/shear.
+            float3 dir = dst > 0 ? d / dst : float3(0, 1, 0);
+            float approach = abs(dot(velI - Velocities[j], dir));
+
+            float kw = ViscosityKernel(dst);   // spatial weight only (closer = more)
+            colourSum += Colors[j] * kw;
+            agitationSum += approach * kw;
+            weightSum += kw;
+        }
+    }
+
+    if (weightSum > 0)
+    {
+        float3 avg = colourSum / weightSum;            // bounded: convex combo of neighbour colours
+        float agitation = agitationSum / weightSum;    // weighted-average head-on relative speed
+
+        // Fraction to move toward the neighbour average this step, in [0,1] -> always stable.
+        // Shaking (high agitation) raises it; dried/set paint (low wetness) stops it.
+        float t = saturate(colorMixRate * deltaTime * Wetness[i] * (1.0 + shakeMixBoost * agitation));
+        Colors[i] = saturate(lerp(colI, avg, t));
+    }
 }
 
 // =================================================================================
