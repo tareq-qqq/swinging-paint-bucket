@@ -13,6 +13,7 @@
 #pragma kernel BitonicSort
 #pragma kernel CalculateOffsets
 #pragma kernel CalculateDensities
+#pragma kernel Environment
 #pragma kernel CalculatePressureForce
 #pragma kernel CalculateViscosity
 #pragma kernel UpdatePositions
@@ -24,6 +25,7 @@ RWStructuredBuffer<float3> Positions;
 RWStructuredBuffer<float3> PredictedPositions;
 RWStructuredBuffer<float3> Velocities;
 RWStructuredBuffer<float2> Densities;       // x = density, y = near-density
+RWStructuredBuffer<float> Wetness;          // 1 = wet, 0 = cured (temperature/humidity/exposure)
 
 // Spatial hash (sorted by cell key). Sized to a power of two for the bitonic sort;
 // padded entries carry key 0xFFFFFFFF so they sort to the end and are ignored.
@@ -44,7 +46,18 @@ float deltaTime;
 float restDensity;
 float pressureMultiplier;
 float nearPressureMultiplier;
-float viscosityStrength;
+float effectiveViscosity;   // viscosityStrength after the global temperature multiplier
+
+// Environment (temperature / humidity / drying / wind). Exposure-gated, like the CPU version.
+uint enableDrying;
+uint enableAirEffects;
+float ambientTemperature;
+float humidity;
+float dryingRate;
+float setWetnessThreshold;
+float airExposureThreshold;
+float3 windForce;
+float airDrag;
 
 // Kernel normalisation constants (3D), precomputed on the CPU.
 float densityScale;
@@ -223,6 +236,39 @@ void CalculateDensities(uint3 id : SV_DispatchThreadID)
 }
 
 // =================================================================================
+//  5b. Environment — temperature/humidity drying + air drag/wind (needs density).
+//      Drying and air motion act only on AIR-EXPOSED paint (low density = surface),
+//      so bulk/enclosed paint is untouched. Mirrors ApplyEnvironment in FluidSim3D.cs.
+//      (Temperature->viscosity is global and folded into effectiveViscosity on the CPU.)
+// =================================================================================
+[numthreads(64, 1, 1)]
+void Environment(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= numParticles) return;
+    uint i = id.x;
+
+    // Air exposure from density: 0 = buried in bulk, 1 = airborne droplet.
+    float bulkDensity = airExposureThreshold * restDensity;
+    float exposure = bulkDensity > 0 ? saturate((bulkDensity - Densities[i].x) / bulkDensity) : 0;
+
+    if (enableDrying != 0)
+    {
+        float tempDryFactor = saturate(ambientTemperature / 40.0);
+        Wetness[i] = max(0.0, Wetness[i] - dryingRate * tempDryFactor * (1.0 - humidity) * exposure * deltaTime);
+
+        // Once "set", freeze the paint's motion (the canvas-sticking hook).
+        if (Wetness[i] <= setWetnessThreshold)
+            Velocities[i] *= max(0.0, 1.0 - 20.0 * deltaTime);
+    }
+
+    if (enableAirEffects != 0 && exposure > 0)
+    {
+        Velocities[i] += windForce * (exposure * deltaTime);          // wind pushes exposed paint
+        Velocities[i] -= Velocities[i] * (airDrag * exposure * deltaTime); // air resistance
+    }
+}
+
+// =================================================================================
 //  6. Pressure force (symmetric) + near-pressure -> velocity.
 // =================================================================================
 [numthreads(64, 1, 1)]
@@ -313,7 +359,7 @@ void CalculateViscosity(uint3 id : SV_DispatchThreadID)
         }
     }
 
-    Velocities[i] += viscForce * (viscosityStrength * deltaTime);
+    Velocities[i] += viscForce * (effectiveViscosity * deltaTime);
 }
 
 // =================================================================================

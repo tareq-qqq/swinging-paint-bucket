@@ -40,15 +40,48 @@ public class FluidSimGPU : MonoBehaviour
     [Range(0f, 1f)]
     public float collisionDamping = 0.45f;
 
+    [Header("Environment — Temperature & Humidity")]
+    [Tooltip("Ambient air temperature (°C). Warmer = thinner paint and faster drying.")]
+    public float ambientTemperature = 20f;
+
+    [Range(0f, 1f)]
+    [Tooltip("Air humidity. Humid air dries slowly; dry air dries fast.")]
+    public float humidity = 0.5f;
+
+    [Tooltip("Strength of temperature → viscosity. 0 = off.")]
+    public float tempViscosityFactor = 0.03f;
+
+    [Header("Environment — Drying / Curing")]
+    public bool enableDrying = true;
+    public float dryingRate = 0.05f;
+
+    [Range(0f, 1f)]
+    public float setWetnessThreshold = 0.15f;
+
+    [Range(0f, 1f)]
+    [Tooltip(
+        "Density fraction below which a particle counts as air-exposed (surface). Higher = thicker exposed skin; too low and nothing registers as surface."
+    )]
+    public float airExposureThreshold = 0.95f;
+
+    [Header("Environment — Air motion (exposed paint only)")]
+    public bool enableAirEffects = true;
+    public Vector3 windForce = Vector3.zero;
+    public float airDrag = 0.5f;
+
     [Header("Bounds (move/rotate this GameObject to slosh the fluid)")]
     public Vector3 boundsSize = new Vector3(10f, 10f, 10f);
 
     [Header("Simulation")]
-    [Tooltip("Physics sub-steps per frame. 1 = fastest (halves dispatches); higher = more stable under hard shaking.")]
+    [Tooltip(
+        "Physics sub-steps per frame. 1 = fastest (halves dispatches); higher = more stable under hard shaking."
+    )]
     [Range(1, 10)]
     public int iterationsPerFrame = 1;
 
-    [Tooltip("Below this framerate the sim slows down (clamps its timestep) instead of taking huge unstable steps. Lower = stays real-time longer but risks jitter; higher = goes slow-motion sooner but stays stable.")]
+    [Tooltip(
+        "Below this framerate the sim slows down (clamps its timestep) instead of taking huge unstable steps. Lower = stays real-time longer but risks jitter; higher = goes slow-motion sooner but stays stable."
+    )]
     public float minStableFramerate = 30f;
 
     [Header("Rendering")]
@@ -60,6 +93,7 @@ public class FluidSimGPU : MonoBehaviour
         predictedBuf,
         velocitiesBuf; // float3
     ComputeBuffer densitiesBuf; // float2
+    ComputeBuffer wetnessBuf; // float (1 = wet, 0 = cured)
     ComputeBuffer spatialKeysBuf,
         spatialIndicesBuf; // uint, padded to pow2
     ComputeBuffer cellStartBuf; // uint, size numParticles
@@ -70,6 +104,7 @@ public class FluidSimGPU : MonoBehaviour
         kSort,
         kOffsets,
         kDensities,
+        kEnvironment,
         kPressure,
         kViscosity,
         kUpdatePositions;
@@ -144,6 +179,7 @@ public class FluidSimGPU : MonoBehaviour
         kSort = compute.FindKernel("BitonicSort");
         kOffsets = compute.FindKernel("CalculateOffsets");
         kDensities = compute.FindKernel("CalculateDensities");
+        kEnvironment = compute.FindKernel("Environment");
         kPressure = compute.FindKernel("CalculatePressureForce");
         kViscosity = compute.FindKernel("CalculateViscosity");
         kUpdatePositions = compute.FindKernel("UpdatePositions");
@@ -158,6 +194,7 @@ public class FluidSimGPU : MonoBehaviour
         predictedBuf = new ComputeBuffer(numParticles, sizeof(float) * 3);
         velocitiesBuf = new ComputeBuffer(numParticles, sizeof(float) * 3);
         densitiesBuf = new ComputeBuffer(numParticles, sizeof(float) * 2);
+        wetnessBuf = new ComputeBuffer(numParticles, sizeof(float));
         spatialKeysBuf = new ComputeBuffer(paddedCount, sizeof(uint));
         spatialIndicesBuf = new ComputeBuffer(paddedCount, sizeof(uint));
         cellStartBuf = new ComputeBuffer(numParticles, sizeof(uint));
@@ -170,6 +207,11 @@ public class FluidSimGPU : MonoBehaviour
         positionsBuf.SetData(positions);
         predictedBuf.SetData(positions); // predicted = positions until the first step
         velocitiesBuf.SetData(velocities);
+
+        var wet = new float[numParticles];
+        for (int i = 0; i < numParticles; i++)
+            wet[i] = 1f; // fully wet to start
+        wetnessBuf.SetData(wet);
     }
 
     void SpawnInGrid(Vector3[] positions, Vector3[] velocities)
@@ -217,6 +259,11 @@ public class FluidSimGPU : MonoBehaviour
         compute.SetBuffer(kDensities, "SpatialIndices", spatialIndicesBuf);
         compute.SetBuffer(kDensities, "CellStart", cellStartBuf);
 
+        // Environment
+        compute.SetBuffer(kEnvironment, "Densities", densitiesBuf);
+        compute.SetBuffer(kEnvironment, "Velocities", velocitiesBuf);
+        compute.SetBuffer(kEnvironment, "Wetness", wetnessBuf);
+
         // CalculatePressureForce
         compute.SetBuffer(kPressure, "PredictedPositions", predictedBuf);
         compute.SetBuffer(kPressure, "Velocities", velocitiesBuf);
@@ -249,6 +296,8 @@ public class FluidSimGPU : MonoBehaviour
         DispatchSort();
         Dispatch(kOffsets, numParticles);
         Dispatch(kDensities, numParticles);
+        if (enableDrying || enableAirEffects)
+            Dispatch(kEnvironment, numParticles);
         Dispatch(kPressure, numParticles);
         Dispatch(kViscosity, numParticles);
         Dispatch(kUpdatePositions, numParticles);
@@ -270,7 +319,21 @@ public class FluidSimGPU : MonoBehaviour
         compute.SetFloat("restDensity", restDensity);
         compute.SetFloat("pressureMultiplier", pressureMultiplier);
         compute.SetFloat("nearPressureMultiplier", nearPressureMultiplier);
-        compute.SetFloat("viscosityStrength", viscosityStrength);
+
+        // Temperature thins/thickens ALL the paint (global) -> fold into effective viscosity.
+        float tempViscMul = Mathf.Max(0.05f, 1f - tempViscosityFactor * (ambientTemperature - 20f));
+        compute.SetFloat("effectiveViscosity", viscosityStrength * tempViscMul);
+
+        // Environment uniforms.
+        compute.SetInt("enableDrying", enableDrying ? 1 : 0);
+        compute.SetInt("enableAirEffects", enableAirEffects ? 1 : 0);
+        compute.SetFloat("ambientTemperature", ambientTemperature);
+        compute.SetFloat("humidity", humidity);
+        compute.SetFloat("dryingRate", dryingRate);
+        compute.SetFloat("setWetnessThreshold", setWetnessThreshold);
+        compute.SetFloat("airExposureThreshold", airExposureThreshold);
+        compute.SetVector("windForce", windForce);
+        compute.SetFloat("airDrag", airDrag);
 
         compute.SetFloat("densityScale", 15f / (2f * Mathf.PI * r5));
         compute.SetFloat("densityDerivScale", 15f / (Mathf.PI * r5));
@@ -422,6 +485,7 @@ public class FluidSimGPU : MonoBehaviour
         predictedBuf?.Release();
         velocitiesBuf?.Release();
         densitiesBuf?.Release();
+        wetnessBuf?.Release();
         spatialKeysBuf?.Release();
         spatialIndicesBuf?.Release();
         cellStartBuf?.Release();

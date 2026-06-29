@@ -408,7 +408,7 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::FluidSimGPU
   compute: {fileID: 7200000, guid: 2cae5998d5ba258b4af2a584fcfdd619, type: 3}
-  particleCount: 30000
+  particleCount: 20000
   particleSpacing: 0.25
   spawnCentre: {x: 0, y: 1.5, z: 0}
   spawnJitter: 0.02
@@ -420,8 +420,19 @@ MonoBehaviour:
   autoCalibrateRestDensity: 1
   gravity: {x: 0, y: -10, z: 0}
   collisionDamping: 0.45
+  ambientTemperature: 100
+  humidity: 0.5
+  tempViscosityFactor: 0.03
+  enableDrying: 1
+  dryingRate: 0.05
+  setWetnessThreshold: 0.15
+  airExposureThreshold: 0.85
+  enableAirEffects: 1
+  windForce: {x: 100, y: 0, z: 0}
+  airDrag: 0
   boundsSize: {x: 10, y: 10, z: 10}
-  iterationsPerFrame: 1
+  iterationsPerFrame: 2
+  minStableFramerate: 30
   paintColor: {r: 0.2, g: 0.55, b: 1, a: 1}
   particleScale: 0.2
 --- !u!4 &1304441045
@@ -433,7 +444,7 @@ Transform:
   m_GameObject: {fileID: 1304441043}
   serializedVersion: 2
   m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: 0.87977, y: 0, z: -0.85214}
+  m_LocalPosition: {x: -1.34, y: 0, z: 1.48}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
   m_Children: []

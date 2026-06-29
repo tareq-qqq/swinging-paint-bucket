@@ -11,8 +11,8 @@ specifics. Only the *execution model* changes: instead of `Parallel.For` over CP
 thread handles one particle, and the neighbour grid is sorted on the GPU. The CPU files are kept as
 the readable reference; this is the high-count path.
 
-This is **Milestone 1: the core fluid** (gravity, spatial hash, density, pressure, viscosity,
-collision, rendering). Temperature/humidity/drying come in Milestone 2.
+**Milestone 1 (core fluid)** and **Milestone 2 (environment)** are both done: gravity, spatial hash,
+density, pressure, viscosity, collision, rendering, **and** temperature/humidity/drying/wind.
 
 ---
 
@@ -111,8 +111,17 @@ lights. (Velocity/colour wiring is left as a hook for the colour-mixing phase.)
 
 ---
 
-## Milestone 2 (next): environment on the GPU
+## Milestone 2 (done): environment on the GPU
 
-Add a `Wetness` buffer and fold the exposure-gated temperature/humidity/drying/wind from
-`ApplyEnvironment` (CPU) into an `Environment` kernel (run after `CalculateDensities`, since it
-needs density), mirroring [`Environment.md`](Environment.md).
+A `Wetness` buffer plus an `Environment` kernel (dispatched right after `CalculateDensities`, since
+it needs density for air-exposure) port the temperature/humidity/drying/wind from `ApplyEnvironment`
+(CPU) — see [`Environment.md`](Environment.md) for the physics. Notes:
+
+- **Temperature → viscosity** is global (heat conducts through the bulk), so it's folded into a
+  single `effectiveViscosity` uniform on the CPU (`viscosityStrength × temperature multiplier`) and
+  used by `CalculateViscosity` — no per-particle work.
+- **Drying, wind and air drag** are exposure-gated inside the `Environment` kernel (exposure from
+  `Densities[i].x`), exactly like the CPU version, so bulk paint is untouched.
+- The `Environment` dispatch is **skipped** when both `enableDrying` and `enableAirEffects` are off.
+
+Next: **Phase 3 — colour mixing** (two paints, pigment diffusion).
