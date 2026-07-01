@@ -91,17 +91,17 @@ public class FluidSimGPU : MonoBehaviour
     )]
     public GameObject boundsVisual;
 
-    [Header("Simulation")]
+    [Header("Simulation (stability)")]
     [Tooltip(
-        "Physics sub-steps per frame. 1 = fastest (halves dispatches); higher = more stable under hard shaking."
+        "Stability: the physics timestep is capped at this × Smoothing Radius. LOWER it if paint explodes (at the rim/hole, on a slow machine, or with small particles) — the sim runs more substeps at a smaller, stable step. 0.02 is a good start."
     )]
-    [Range(1, 10)]
-    public int iterationsPerFrame = 1;
+    public float stabilityCFL = 0.02f;
 
+    [Range(1, 16)]
     [Tooltip(
-        "Below this framerate the sim slows down (clamps its timestep) instead of taking huge unstable steps. Lower = stays real-time longer but risks jitter; higher = goes slow-motion sooner but stays stable."
+        "Max physics substeps per frame (a performance cap). If the machine can't keep up at the stable timestep, the sim runs in SLOW-MOTION instead of exploding."
     )]
-    public float minStableFramerate = 30f;
+    public int maxSubsteps = 8;
 
     [Header("Color mixing (2 paints)")]
     public bool enableColorMixing = true;
@@ -216,9 +216,8 @@ public class FluidSimGPU : MonoBehaviour
         ready = true;
     }
 
-    // Simulate in Update (not FixedUpdate) so we run EXACTLY iterationsPerFrame sub-steps per
-    // rendered frame. FixedUpdate would run extra times to "catch up" when a step is heavy,
-    // multiplying the ~200 dispatches/step into a death spiral — the classic GPU-sim lag trap.
+    // Simulate in Update (not FixedUpdate) to avoid FixedUpdate's "catch-up" death spiral. The
+    // number of substeps is chosen so each physics step is <= a STABLE size (see below).
     void Update()
     {
         // Sim is frozen until the (deferred) spawn + calibration finishes — see Start. Still render
@@ -231,9 +230,16 @@ public class FluidSimGPU : MonoBehaviour
 
         if (numParticles >= 2)
         {
-            float frameDt = Mathf.Min(Time.deltaTime, 1f / Mathf.Max(1f, minStableFramerate)); // clamp so a hitch can't explode the sim
-            float dt = frameDt / iterationsPerFrame;
-            for (int i = 0; i < iterationsPerFrame; i++)
+            // Cap the physics timestep for STABILITY, independent of frame rate. A big dt (low FPS,
+            // or small particles) makes the pressure forces overshoot in one step, so the paint
+            // explodes at thin regions (rim / hole / free surface). Split the frame into enough
+            // substeps that each is <= dtCap; if that needs more than maxSubsteps the sim runs in
+            // slow-motion instead of exploding. (A faster machine had a smaller dt = didn't explode.)
+            float dtCap = Mathf.Max(1e-4f, stabilityCFL * smoothingRadius);
+            float frameDt = Mathf.Min(Time.deltaTime, maxSubsteps * dtCap);
+            int n = Mathf.Clamp(Mathf.CeilToInt(frameDt / dtCap), 1, maxSubsteps);
+            float dt = frameDt / n; // guaranteed <= dtCap
+            for (int i = 0; i < n; i++)
                 SimulationStep(dt);
         }
 
