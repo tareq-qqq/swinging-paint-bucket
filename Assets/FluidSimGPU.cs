@@ -21,8 +21,15 @@ public class FluidSimGPU : MonoBehaviour
     public ComputeShader compute;
 
     [Header("Spawn")]
+    [Tooltip(
+        "Amount of paint = number of particles. (~20k for the box demo; a bucket holds far fewer.)"
+    )]
     public int particleCount = 20000;
     public float particleSpacing = 0.25f;
+
+    [Tooltip(
+        "Box mode: where the paint block spawns. In bucket mode the paint spawns inside the bucket."
+    )]
     public Vector3 spawnCentre = new Vector3(0f, 1.5f, 0f);
     public float spawnJitter = 0.02f;
 
@@ -34,24 +41,24 @@ public class FluidSimGPU : MonoBehaviour
     public float viscosityStrength = 0.12f;
     public bool autoCalibrateRestDensity = true;
 
-    [Header("Environment")]
-    public Vector3 gravity = new Vector3(0f, -10f, 0f);
+    // NOTE: the ambient environment INPUTS — gravity, air resistance, ambient temperature,
+    // humidity and wind — now live on the shared EnvironmentConfig component (one source for the
+    // paint, the bucket pendulum and the rope). The fields below are only how THIS paint RESPONDS
+    // to them, plus sim/collision tuning.
 
+    [Header("Collision")]
     [Range(0f, 1f)]
+    [Tooltip("Bounce energy kept on a wall hit (0 = no bounce, 1 = perfectly elastic).")]
     public float collisionDamping = 0.45f;
 
-    [Header("Environment — Temperature & Humidity")]
-    [Tooltip("Ambient air temperature (°C). Warmer = thinner paint and faster drying.")]
-    public float ambientTemperature = 20f;
+    [Tooltip(
+        "Velocity safety clamp (world units/sec). Stops a bad spawn or a fast bucket move from blowing the sim up. 0 = off. ~25 suits the bucket scale."
+    )]
+    public float maxSpeed = 25f;
 
-    [Range(0f, 1f)]
-    [Tooltip("Air humidity. Humid air dries slowly; dry air dries fast.")]
-    public float humidity = 0.5f;
-
+    [Header("Paint — drying / curing (responds to EnvironmentConfig temperature & humidity)")]
     [Tooltip("Strength of temperature → viscosity. 0 = off.")]
     public float tempViscosityFactor = 0.03f;
-
-    [Header("Environment — Drying / Curing")]
     public bool enableDrying = true;
     public float dryingRate = 0.05f;
 
@@ -64,13 +71,25 @@ public class FluidSimGPU : MonoBehaviour
     )]
     public float airExposureThreshold = 0.95f;
 
-    [Header("Environment — Air motion (exposed paint only)")]
+    [Header("Paint — air response (wind & air drag are set on EnvironmentConfig)")]
+    [Tooltip(
+        "Whether the air-exposed paint responds to the EnvironmentConfig wind and air resistance."
+    )]
     public bool enableAirEffects = true;
-    public Vector3 windForce = Vector3.zero;
-    public float airDrag = 0.5f;
 
-    [Header("Bounds (move/rotate this GameObject to slosh the fluid)")]
+    [Header("Bounds — transparent box (move/rotate this GameObject to slosh the fluid)")]
     public Vector3 boundsSize = new Vector3(10f, 10f, 10f);
+
+    [Header("Container override (optional)")]
+    [Tooltip(
+        "OPTIONAL. Leave empty for the standalone box demo. Assign a BucketContainer to instead contain the paint in the swinging bucket (cylinder + floor spill-hole). This is the only switch between the two demos."
+    )]
+    public BucketContainer container;
+
+    [Tooltip(
+        "OPTIONAL. A transparent-box visual GameObject for the box demo; it is auto-hidden whenever a Container (bucket) is assigned, so the box doesn't show in bucket mode."
+    )]
+    public GameObject boundsVisual;
 
     [Header("Simulation")]
     [Tooltip(
@@ -123,6 +142,7 @@ public class FluidSimGPU : MonoBehaviour
     ComputeBuffer densitiesBuf; // float2
     ComputeBuffer wetnessBuf; // float (1 = wet, 0 = cured)
     ComputeBuffer colorsBuf; // float3: .x = mix fraction t (0=paint A, 1=paint B)
+    ComputeBuffer releasedBuf; // uint: 1 once a particle has drained out the bucket hole
     ComputeBuffer mixLutBuf; // float3 LUT: t -> displayed colour (spectral Kubelka-Munk)
     const int MixLutSize = 64;
     Color lutColorA,
@@ -145,6 +165,10 @@ public class FluidSimGPU : MonoBehaviour
 
     int numParticles;
     int paddedCount; // next power of two >= numParticles (for the bitonic sort)
+    bool warnedNoEnvironment; // so the "no EnvironmentConfig" warning fires only once
+
+    Vector3[] bucketLocalSpawn; // bucket-local paint positions (count = volume × fillFraction)
+    bool ready; // false until the (deferred) spawn + calibration is done; the sim is frozen until then
 
     // --- rendering ---
     Mesh particleMesh;
@@ -155,13 +179,13 @@ public class FluidSimGPU : MonoBehaviour
     const int SORT_GROUP = 128; // numthreads for the bitonic sort kernel
 
     // =================================================================================
-    void Start()
+    System.Collections.IEnumerator Start()
     {
         if (compute == null)
         {
             Debug.LogError("FluidSimGPU: assign FluidCompute.compute to the 'Compute' slot.");
             enabled = false;
-            return;
+            yield break;
         }
 
         // Confirm which GPU/backend Unity is actually using (Intel integrated vs NVIDIA dGPU).
@@ -174,8 +198,22 @@ public class FluidSimGPU : MonoBehaviour
         BindBuffers();
         BuildRenderResources();
 
+        // BUCKET: wait until the pendulum + rope have actually moved the bucket to its starting
+        // swing pose (a couple of FixedUpdates) BEFORE placing the paint and calibrating — otherwise
+        // the paint is placed at the bucket's editor pose, the bucket then jumps, and the collision
+        // sees all the paint outside the cylinder and blows it off the walls. The sim is frozen
+        // (see Update's !ready guard) until this is done.
+        if (container != null && container.Active)
+        {
+            yield return new WaitForFixedUpdate();
+            yield return new WaitForFixedUpdate();
+            PlaceBucketPaint();
+        }
+
         if (autoCalibrateRestDensity)
             CalibrateRestDensity();
+
+        ready = true;
     }
 
     // Simulate in Update (not FixedUpdate) so we run EXACTLY iterationsPerFrame sub-steps per
@@ -183,6 +221,14 @@ public class FluidSimGPU : MonoBehaviour
     // multiplying the ~200 dispatches/step into a death spiral — the classic GPU-sim lag trap.
     void Update()
     {
+        // Sim is frozen until the (deferred) spawn + calibration finishes — see Start. Still render
+        // so the paint is visible while it gets placed.
+        if (!ready)
+        {
+            RenderParticles();
+            return;
+        }
+
         if (numParticles >= 2)
         {
             float frameDt = Mathf.Min(Time.deltaTime, 1f / Mathf.Max(1f, minStableFramerate)); // clamp so a hitch can't explode the sim
@@ -194,6 +240,14 @@ public class FluidSimGPU : MonoBehaviour
         // Live inspector tuning: rebuild the t -> colour LUT only when a paint colour changes.
         if (mixLutBuf != null && (paintColorA != lutColorA || paintColorB != lutColorB))
             BuildMixLut();
+
+        // The transparent box belongs to the box demo only — hide it whenever a bucket is in use.
+        if (boundsVisual != null)
+        {
+            bool showBox = !(container != null && container.Active);
+            if (boundsVisual.activeSelf != showBox)
+                boundsVisual.SetActive(showBox);
+        }
 
         RenderParticles();
     }
@@ -226,7 +280,28 @@ public class FluidSimGPU : MonoBehaviour
 
     void InitBuffers()
     {
-        numParticles = Mathf.Max(0, particleCount);
+        // --- Decide the spawn + the particle count ---
+        // BUCKET: build a CYLINDER of paint in the bucket's LOCAL frame; the count comes from the
+        //   bucket volume × fillFraction (so "amount of paint" is just a slider). The local points
+        //   are transformed to world on the first frame (deferred), once the pendulum has placed
+        //   the bucket, so the paint always lands INSIDE it.
+        // BOX: the unchanged centred cube grid in world; count = particleCount.
+        bool useBucket = container != null && container.Active;
+        Vector3[] colors;
+
+        if (useBucket)
+        {
+            bucketLocalSpawn = container.BuildLocalSpawn(particleSpacing, spawnJitter);
+            numParticles = Mathf.Max(2, bucketLocalSpawn.Length);
+            Debug.Log(
+                $"[FluidSimGPU] Bucket fill: {bucketLocalSpawn.Length} particles "
+                    + $"(capacity {container.Capacity(particleSpacing)} at spacing {particleSpacing})."
+            );
+        }
+        else
+        {
+            numParticles = Mathf.Max(0, particleCount);
+        }
         paddedCount = Mathf.NextPowerOfTwo(Mathf.Max(2, numParticles));
 
         positionsBuf = new ComputeBuffer(numParticles, sizeof(float) * 3);
@@ -235,36 +310,63 @@ public class FluidSimGPU : MonoBehaviour
         densitiesBuf = new ComputeBuffer(numParticles, sizeof(float) * 2);
         wetnessBuf = new ComputeBuffer(numParticles, sizeof(float));
         colorsBuf = new ComputeBuffer(numParticles, sizeof(float) * 3);
+        releasedBuf = new ComputeBuffer(numParticles, sizeof(uint)); // all 0 (captured) by default
         spatialKeysBuf = new ComputeBuffer(paddedCount, sizeof(uint));
         spatialIndicesBuf = new ComputeBuffer(paddedCount, sizeof(uint));
         cellStartBuf = new ComputeBuffer(numParticles, sizeof(uint));
 
-        // Spawn a centred cube grid on the CPU and upload.
         var positions = new Vector3[numParticles];
-        var velocities = new Vector3[numParticles];
-        SpawnInGrid(positions, velocities);
+        var velocities = new Vector3[numParticles]; // start at rest
+        colors = new Vector3[numParticles];
+
+        if (useBucket)
+        {
+            // Provisional world placement (re-done correctly by PlaceBucketPaint once the bucket settles).
+            Matrix4x4 toWorld = container.Pose.localToWorldMatrix;
+            for (int i = 0; i < numParticles; i++)
+            {
+                positions[i] = toWorld.MultiplyPoint3x4(bucketLocalSpawn[i]);
+                // Two paints split across the bucket's LOCAL x (pose-independent): left=A, right=B.
+                colors[i] = new Vector3(bucketLocalSpawn[i].x < 0f ? 0f : 1f, 0f, 0f);
+            }
+        }
+        else
+        {
+            SpawnInGrid(positions, velocities);
+            for (int i = 0; i < numParticles; i++)
+                colors[i] = new Vector3(positions[i].x < spawnCentre.x ? 0f : 1f, 0f, 0f);
+        }
 
         positionsBuf.SetData(positions);
         predictedBuf.SetData(positions); // predicted = positions until the first step
         velocitiesBuf.SetData(velocities);
 
-        // The per-particle colour buffer stores a single MIX FRACTION t in .x (0 = paint A,
-        // 1 = paint B); .y/.z are unused. The diffusion kernel averages this scalar, and the
-        // shader maps t -> displayed colour through the spectral Kubelka-Munk LUT (see BuildMixLut).
-        // Storing t (not RGB) keeps mixing in spectral space with exact, vivid endpoint colours.
+        // Colors[i].x = MIX FRACTION t (0 = paint A, 1 = paint B); the shader maps t -> displayed
+        // colour through the spectral Kubelka-Munk LUT (see BuildMixLut). Wetness starts fully wet.
         var wet = new float[numParticles];
-        var colors = new Vector3[numParticles];
         for (int i = 0; i < numParticles; i++)
-        {
-            wet[i] = 1f; // fully wet to start
-            // Two paints: left half of the spawn block = A (t=0), right half = B (t=1).
-            float t = positions[i].x < spawnCentre.x ? 0f : 1f;
-            colors[i] = new Vector3(t, 0f, 0f);
-        }
+            wet[i] = 1f;
         wetnessBuf.SetData(wet);
         colorsBuf.SetData(colors);
+        releasedBuf.SetData(new uint[numParticles]); // all 0 = all paint starts captured by the bucket
 
         BuildMixLut();
+    }
+
+    // Re-place the bucket paint at the bucket's REAL pose (called on the first frame, after the
+    // pendulum has positioned the bucket) so it spawns inside instead of where the bucket sat at Start.
+    void PlaceBucketPaint()
+    {
+        if (bucketLocalSpawn == null || container == null || !container.Active)
+            return;
+        Matrix4x4 toWorld = container.Pose.localToWorldMatrix;
+        var positions = new Vector3[numParticles];
+        for (int i = 0; i < numParticles; i++)
+            positions[i] = toWorld.MultiplyPoint3x4(bucketLocalSpawn[i]);
+        positionsBuf.SetData(positions);
+        predictedBuf.SetData(positions);
+        velocitiesBuf.SetData(new Vector3[numParticles]); // reset to rest
+        releasedBuf.SetData(new uint[numParticles]); // freshly placed paint is captured again
     }
 
     void SpawnInGrid(Vector3[] positions, Vector3[] velocities)
@@ -311,6 +413,7 @@ public class FluidSimGPU : MonoBehaviour
         compute.SetBuffer(kDensities, "SpatialKeys", spatialKeysBuf);
         compute.SetBuffer(kDensities, "SpatialIndices", spatialIndicesBuf);
         compute.SetBuffer(kDensities, "CellStart", cellStartBuf);
+        compute.SetBuffer(kDensities, "Released", releasedBuf);
 
         // Environment
         compute.SetBuffer(kEnvironment, "Densities", densitiesBuf);
@@ -324,6 +427,7 @@ public class FluidSimGPU : MonoBehaviour
         compute.SetBuffer(kPressure, "SpatialKeys", spatialKeysBuf);
         compute.SetBuffer(kPressure, "SpatialIndices", spatialIndicesBuf);
         compute.SetBuffer(kPressure, "CellStart", cellStartBuf);
+        compute.SetBuffer(kPressure, "Released", releasedBuf);
 
         // CalculateViscosity
         compute.SetBuffer(kViscosity, "PredictedPositions", predictedBuf);
@@ -331,6 +435,7 @@ public class FluidSimGPU : MonoBehaviour
         compute.SetBuffer(kViscosity, "SpatialKeys", spatialKeysBuf);
         compute.SetBuffer(kViscosity, "SpatialIndices", spatialIndicesBuf);
         compute.SetBuffer(kViscosity, "CellStart", cellStartBuf);
+        compute.SetBuffer(kViscosity, "Released", releasedBuf);
 
         // MixColors
         compute.SetBuffer(kMixColors, "PredictedPositions", predictedBuf);
@@ -340,10 +445,12 @@ public class FluidSimGPU : MonoBehaviour
         compute.SetBuffer(kMixColors, "SpatialKeys", spatialKeysBuf);
         compute.SetBuffer(kMixColors, "SpatialIndices", spatialIndicesBuf);
         compute.SetBuffer(kMixColors, "CellStart", cellStartBuf);
+        compute.SetBuffer(kMixColors, "Released", releasedBuf);
 
         // UpdatePositions
         compute.SetBuffer(kUpdatePositions, "Positions", positionsBuf);
         compute.SetBuffer(kUpdatePositions, "Velocities", velocitiesBuf);
+        compute.SetBuffer(kUpdatePositions, "Released", releasedBuf);
     }
 
     // =================================================================================
@@ -374,6 +481,25 @@ public class FluidSimGPU : MonoBehaviour
         float r6 = r5 * r;
         float r9 = r6 * r * r * r;
 
+        // ALL ambient environment inputs (gravity / temperature / humidity / wind / air resistance)
+        // come from the one shared EnvironmentConfig, so they're entered ONCE and the paint, the
+        // bucket pendulum and the rope all agree. If none is in the scene we use safe defaults and
+        // warn once (add an EnvironmentConfig to control them).
+        var env = EnvironmentConfig.Instance;
+        if (env == null && !warnedNoEnvironment)
+        {
+            Debug.LogWarning(
+                "[FluidSimGPU] No EnvironmentConfig in the scene — using default gravity/temperature/"
+                    + "humidity/wind/air resistance. Add one EnvironmentConfig to set them (shared with the bucket & rope)."
+            );
+            warnedNoEnvironment = true;
+        }
+        Vector3 gravityV = env != null ? env.GravityVector : new Vector3(0f, -9.81f, 0f);
+        float temperatureV = env != null ? env.ambientTemperature : 20f;
+        float humidityV = env != null ? env.humidity : 0.5f;
+        Vector3 windV = env != null ? env.wind : Vector3.zero;
+        float airDragV = env != null ? env.airResistance : 0.1f;
+
         compute.SetInt("numParticles", numParticles);
         compute.SetInt("numEntries", paddedCount);
         compute.SetFloat("smoothingRadius", r);
@@ -385,19 +511,19 @@ public class FluidSimGPU : MonoBehaviour
         compute.SetFloat("nearPressureMultiplier", nearPressureMultiplier);
 
         // Temperature thins/thickens ALL the paint (global) -> fold into effective viscosity.
-        float tempViscMul = Mathf.Max(0.05f, 1f - tempViscosityFactor * (ambientTemperature - 20f));
+        float tempViscMul = Mathf.Max(0.05f, 1f - tempViscosityFactor * (temperatureV - 20f));
         compute.SetFloat("effectiveViscosity", viscosityStrength * tempViscMul);
 
         // Environment uniforms.
         compute.SetInt("enableDrying", enableDrying ? 1 : 0);
         compute.SetInt("enableAirEffects", enableAirEffects ? 1 : 0);
-        compute.SetFloat("ambientTemperature", ambientTemperature);
-        compute.SetFloat("humidity", humidity);
+        compute.SetFloat("ambientTemperature", temperatureV);
+        compute.SetFloat("humidity", humidityV);
         compute.SetFloat("dryingRate", dryingRate);
         compute.SetFloat("setWetnessThreshold", setWetnessThreshold);
         compute.SetFloat("airExposureThreshold", airExposureThreshold);
-        compute.SetVector("windForce", windForce);
-        compute.SetFloat("airDrag", airDrag);
+        compute.SetVector("windForce", windV);
+        compute.SetFloat("airDrag", airDragV);
 
         compute.SetFloat("colorMixRate", colorMixRate);
         compute.SetFloat("shakeMixBoost", shakeMixBoost);
@@ -408,14 +534,30 @@ public class FluidSimGPU : MonoBehaviour
         compute.SetFloat("nearDensityDerivScale", 45f / (Mathf.PI * r6));
         compute.SetFloat("viscScale", 315f / (64f * Mathf.PI * r9));
 
-        compute.SetVector("gravity", gravity);
+        compute.SetVector("gravity", gravityV);
         compute.SetFloat("collisionDamping", collisionDamping);
+        compute.SetFloat("maxSpeed", maxSpeed);
         compute.SetVector("boundsSize", boundsSize);
 
-        // Box pose (rotation + translation only, no scale) for the rotated-box collision.
-        Matrix4x4 localToWorld = Matrix4x4.TRS(transform.position, transform.rotation, Vector3.one);
+        // Container pose + shape. With a bucket assigned the paint is contained by the bucket
+        // CYLINDER (radius, height, a floor spill-hole, open top) in the bucket's local frame,
+        // so it sloshes/tilts and drains exactly as the bucket swings. With no bucket we fall
+        // back to the rotated BOX defined by this GameObject + boundsSize (the old behaviour).
+        bool useCylinder = container != null && container.Active;
+        Transform c = useCylinder ? container.Pose : transform;
+        Matrix4x4 localToWorld = Matrix4x4.TRS(c.position, c.rotation, Vector3.one);
         compute.SetMatrix("localToWorld", localToWorld);
         compute.SetMatrix("worldToLocal", localToWorld.inverse);
+
+        compute.SetInt("containerIsCylinder", useCylinder ? 1 : 0);
+        if (useCylinder)
+        {
+            compute.SetFloat("cylinderRadius", container.Radius);
+            compute.SetFloat("cylinderHeight", container.Height);
+            compute.SetFloat("cylinderFloorY", container.FloorY);
+            compute.SetFloat("holeRadius", container.HoleRadius);
+            compute.SetInt("openTop", container.OpenTop ? 1 : 0);
+        }
     }
 
     // Standard GPU bitonic merge sort: one dispatch per (stage, step).
@@ -699,6 +841,7 @@ public class FluidSimGPU : MonoBehaviour
         densitiesBuf?.Release();
         wetnessBuf?.Release();
         colorsBuf?.Release();
+        releasedBuf?.Release();
         mixLutBuf?.Release();
         mixLutBuf = null;
         spatialKeysBuf?.Release();
@@ -720,6 +863,9 @@ public class FluidSimGPU : MonoBehaviour
 
     void OnDrawGizmos()
     {
+        // In bucket mode the box is irrelevant — don't draw its wireframe (the bucket has its own).
+        if (container != null && container.Active)
+            return;
         Gizmos.color = new Color(0.4f, 0.4f, 0.4f);
         Gizmos.matrix = Matrix4x4.TRS(transform.position, transform.rotation, Vector3.one);
         Gizmos.DrawWireCube(Vector3.zero, boundsSize);

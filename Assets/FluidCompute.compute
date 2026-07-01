@@ -28,6 +28,7 @@ RWStructuredBuffer<float3> Velocities;
 RWStructuredBuffer<float2> Densities;       // x = density, y = near-density
 RWStructuredBuffer<float> Wetness;          // 1 = wet, 0 = cured (temperature/humidity/exposure)
 RWStructuredBuffer<float3> Colors;          // per-particle pigment RGB (two paints, blended by MixColors)
+RWStructuredBuffer<uint> Released;          // 1 once a particle has drained out the bucket hole (no longer collides with the bucket)
 
 // Spatial hash (sorted by cell key). Sized to a power of two for the bitonic sort;
 // padded entries carry key 0xFFFFFFFF so they sort to the end and are ignored.
@@ -74,9 +75,18 @@ float viscScale;
 
 float3 gravity;
 float collisionDamping;
+float maxSpeed;             // velocity safety clamp (world units/sec); <=0 = off
 float3 boundsSize;
-float4x4 worldToLocal;      // box: rotation+translation only (no scale)
+float4x4 worldToLocal;      // container: rotation+translation only (no scale)
 float4x4 localToWorld;
+
+// Container shape. 0 = the box (boundsSize); 1 = the bucket cylinder below.
+int containerIsCylinder;
+float cylinderRadius;
+float cylinderHeight;
+float cylinderFloorY;       // local Y of the floor (= -cylinderHeight/2)
+float holeRadius;           // radius of the floor spill-hole paint drains through
+int openTop;                // 1 = paint may leave over the rim; 0 = sealed lid
 
 // Bitonic sort stage parameters.
 uint groupWidth;
@@ -210,6 +220,7 @@ void CalculateDensities(uint3 id : SV_DispatchThreadID)
 {
     if (id.x >= numParticles) return;
     uint i = id.x;
+    uint relI = Released[i]; // paint still in the bucket (0) and drained paint (1) are separate fluids
 
     float3 pos = PredictedPositions[i];
     int3 centre = CellCoord(pos);
@@ -228,6 +239,7 @@ void CalculateDensities(uint3 id : SV_DispatchThreadID)
         {
             if (SpatialKeys[s] != key) break;
             uint j = SpatialIndices[s];
+            if (Released[j] != relI) continue; // don't couple across the wall (in-bucket vs drained)
 
             float3 d = PredictedPositions[j] - pos;
             float sqr = dot(d, d);
@@ -282,6 +294,7 @@ void CalculatePressureForce(uint3 id : SV_DispatchThreadID)
 {
     if (id.x >= numParticles) return;
     uint i = id.x;
+    uint relI = Released[i];
 
     float densityI = Densities[i].x;
     if (densityI <= 0) return;
@@ -305,6 +318,7 @@ void CalculatePressureForce(uint3 id : SV_DispatchThreadID)
             if (SpatialKeys[s] != key) break;
             uint j = SpatialIndices[s];
             if (j == i) continue;
+            if (Released[j] != relI) continue; // in-bucket vs drained: no force across the wall
 
             float3 offset = PredictedPositions[j] - pos;
             float sqr = dot(offset, offset);
@@ -337,6 +351,7 @@ void CalculateViscosity(uint3 id : SV_DispatchThreadID)
 {
     if (id.x >= numParticles) return;
     uint i = id.x;
+    uint relI = Released[i];
 
     float3 pos = PredictedPositions[i];
     float3 velI = Velocities[i];
@@ -356,6 +371,7 @@ void CalculateViscosity(uint3 id : SV_DispatchThreadID)
             if (SpatialKeys[s] != key) break;
             uint j = SpatialIndices[s];
             if (j == i) continue;
+            if (Released[j] != relI) continue; // don't let drained paint drag on the bucket liquid
 
             float3 d = PredictedPositions[j] - pos;
             float sqr = dot(d, d);
@@ -385,6 +401,7 @@ void MixColors(uint3 id : SV_DispatchThreadID)
     // Diffusing t (averaging toward neighbours) is the mixing; the displayed colour comes from a
     // CPU-baked spectral Kubelka-Munk LUT keyed by t (see FluidSimGPU.BuildMixLut). Averaging this
     // scalar keeps the blend in subtractive paint space, so blue + yellow tends to green, not grey.
+    uint relI = Released[i];
     float3 pos = PredictedPositions[i];
     float3 velI = Velocities[i];
     float3 colI = Colors[i];
@@ -409,6 +426,7 @@ void MixColors(uint3 id : SV_DispatchThreadID)
             if (SpatialKeys[s] != key) break;
             uint j = SpatialIndices[s];
             if (j == i) continue;
+            if (Released[j] != relI) continue; // don't let drained paint drag on the bucket liquid
 
             float3 d = pos - PredictedPositions[j];
             float sqr = dot(d, d);
@@ -439,7 +457,8 @@ void MixColors(uint3 id : SV_DispatchThreadID)
 }
 
 // =================================================================================
-//  8. Integrate + rotated-box collision (clamp in the box's local frame).
+//  8. Integrate + container collision (clamp in the container's local frame).
+//     containerIsCylinder picks the bucket cylinder (with a floor spill-hole) or the box.
 // =================================================================================
 [numthreads(64, 1, 1)]
 void UpdatePositions(uint3 id : SV_DispatchThreadID)
@@ -447,19 +466,83 @@ void UpdatePositions(uint3 id : SV_DispatchThreadID)
     if (id.x >= numParticles) return;
     uint i = id.x;
 
-    float3 pos = Positions[i] + Velocities[i] * deltaTime;
     float3 vel = Velocities[i];
 
-    // World -> box-local (rotation+translation only).
+    // Safety speed clamp: bound the velocity so a bad spawn, a fast container move (dragging the
+    // bucket), or a transient density spike can't blow the whole sim up to infinity. The sim then
+    // settles instead of exploding. maxSpeed <= 0 disables it.
+    if (maxSpeed > 0.0)
+    {
+        float sp = length(vel);
+        if (sp > maxSpeed)
+            vel *= maxSpeed / sp;
+    }
+
+    float3 pos = Positions[i] + vel * deltaTime;
+
+    // World -> container-local (rotation+translation only).
     float3 local = mul(worldToLocal, float4(pos, 1)).xyz;
     float3 localVel = mul((float3x3)worldToLocal, vel);
-    float3 half = boundsSize * 0.5;
 
-    if (abs(local.x) > half.x) { local.x = half.x * sign(local.x); localVel.x *= -collisionDamping; }
-    if (abs(local.y) > half.y) { local.y = half.y * sign(local.y); localVel.y *= -collisionDamping; }
-    if (abs(local.z) > half.z) { local.z = half.z * sign(local.z); localVel.z *= -collisionDamping; }
+    if (containerIsCylinder)
+    {
+        // A particle that has drained out the hole is FREE — the bucket must never collide with it
+        // again, otherwise when the bucket swings back it sweeps over the fallen paint and flings it
+        // ("paint appears out of nowhere and explodes"). So skip all bucket collision once released.
+        if (Released[i] == 0)
+        {
+            float floorY = cylinderFloorY;
+            float topY = cylinderFloorY + cylinderHeight;
+            float r = length(local.xz);
 
-    // box-local -> world.
+            // Floor FIRST, and SOLID at any depth (no thin slab — a slab let fast paint tunnel
+            // through and leak out the bottom as a flat exploding sheet). Everywhere except the
+            // central hole, push the particle back up to the floor. Drained paint can't be yanked
+            // up because it's already flagged Released (and skipped), so the floor is safely solid.
+            if (local.y < floorY && r > holeRadius)
+            {
+                local.y = floorY;
+                if (localVel.y < 0) localVel.y *= -collisionDamping;
+            }
+
+            // Side wall: contain the radius within the height band. Because the floor already lifted
+            // bottom-corner particles up to floorY, this seals the floor/wall seam in one pass.
+            if (local.y >= floorY && local.y <= topY && r > cylinderRadius && r > 1e-6)
+            {
+                float2 n = local.xz / r;                    // outward radial normal
+                local.xz = n * cylinderRadius;
+                float vn = dot(localVel.xz, n);
+                if (vn > 0) localVel.xz -= (1.0 + collisionDamping) * vn * n; // reflect + damp
+            }
+
+            // Rim: open by default (paint may be flung out); a sealed lid clamps the top.
+            if (!openTop && local.y > topY)
+            {
+                local.y = topY;
+                if (localVel.y > 0) localVel.y *= -collisionDamping;
+            }
+
+            // A particle has LEFT the bucket once it is either below the floor through the central
+            // hole, OR (open top) above the rim height. Free it the instant it clears the rim — not
+            // after it has also moved outward — otherwise pouring paint piles up at the rim lip while
+            // still coupled to the inside liquid and spikes the pressure (the rim explosion). Freeing
+            // it also stops the swinging walls / infinite-plane floor from ever recapturing it.
+            bool outHole = (local.y < floorY && r <= holeRadius);
+            bool outRim = (openTop && local.y > topY);
+            if (outHole || outRim)
+                Released[i] = 1;
+        }
+    }
+    else
+    {
+        // Rotated box: clamp X/Y/Z in local space.
+        float3 half = boundsSize * 0.5;
+        if (abs(local.x) > half.x) { local.x = half.x * sign(local.x); localVel.x *= -collisionDamping; }
+        if (abs(local.y) > half.y) { local.y = half.y * sign(local.y); localVel.y *= -collisionDamping; }
+        if (abs(local.z) > half.z) { local.z = half.z * sign(local.z); localVel.z *= -collisionDamping; }
+    }
+
+    // container-local -> world.
     pos = mul(localToWorld, float4(local, 1)).xyz;
     vel = mul((float3x3)localToWorld, localVel);
 

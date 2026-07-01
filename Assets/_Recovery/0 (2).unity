@@ -135,7 +135,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!114 &64464981
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -191,7 +191,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!114 &321854590
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -313,7 +313,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!114 &646856879
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -386,7 +386,7 @@ MonoBehaviour:
   m_EditorClassIdentifier: Assembly-CSharp::BucketContainer
   bucket: {fileID: 1888754126}
   openTop: 1
-  fillFraction: 0.953
+  fillFraction: 0.833
 --- !u!1 &705507993
 GameObject:
   m_ObjectHideFlags: 0
@@ -500,7 +500,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!114 &824018234
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -643,7 +643,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!114 &1198570910
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -804,7 +804,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!114 &1297163850
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -854,7 +854,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 0
+  m_IsActive: 1
 --- !u!114 &1304441044
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -869,7 +869,7 @@ MonoBehaviour:
   m_EditorClassIdentifier: Assembly-CSharp::FluidSimGPU
   compute: {fileID: 7200000, guid: 2cae5998d5ba258b4af2a584fcfdd619, type: 3}
   particleCount: 20000
-  particleSpacing: 0.25
+  particleSpacing: 0.2
   spawnCentre: {x: 0, y: 1.5, z: 0}
   spawnJitter: 0.02
   smoothingRadius: 0.5
@@ -897,7 +897,7 @@ MonoBehaviour:
   mixVibrance: 0.45
   colorMixRate: 1
   shakeMixBoost: 0.5
-  particleScale: 0.2
+  particleScale: 0.16
 --- !u!4 &1304441045
 Transform:
   m_ObjectHideFlags: 0
@@ -928,7 +928,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!4 &1407026067
 Transform:
   m_ObjectHideFlags: 0
@@ -961,7 +961,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!114 &1888754126
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -978,7 +978,7 @@ MonoBehaviour:
   bucketRadius: 1.5
   bucketHeight: 4
   bucketFloorY: -0.175
-  holeRadius: 0
+  holeRadius: 0.2
   pendulum: {fileID: 64464981}
 --- !u!4 &1888754127
 Transform:
