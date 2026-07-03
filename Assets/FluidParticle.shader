@@ -29,6 +29,7 @@ Shader "Custom/FluidParticle"
             StructuredBuffer<float3> Positions;
             StructuredBuffer<float3> Colors;   // .x = per-particle mix fraction t (0=paint A, 1=paint B)
             StructuredBuffer<float3> MixLut;   // t -> displayed colour, baked on the CPU (FluidSimGPU.BuildMixLut)
+            StructuredBuffer<uint> Absorbed;   // 1 = soaked into the canvas -> collapse the sphere so it's hidden
             int MixLutSize;
             float _Scale;
 
@@ -61,7 +62,10 @@ Shader "Custom/FluidParticle"
             {
                 v2f o;
                 float3 centre = Positions[instanceID];
-                float3 worldPos = centre + v.vertex * _Scale; // sphere is not rotated per-instance
+                // Soaked-into-canvas paint: scale 0 collapses every vertex to the centre -> a
+                // zero-area (degenerate) triangle the GPU discards, so the particle vanishes.
+                float scale = (Absorbed[instanceID] != 0u) ? 0.0 : _Scale;
+                float3 worldPos = centre + v.vertex * scale; // sphere is not rotated per-instance
                 o.pos = UnityWorldToClipPos(worldPos);
                 o.normal = v.normal;
                 o.color = SampleMix(Colors[instanceID].x); // mix fraction -> spectral Kubelka-Munk colour (LUT)

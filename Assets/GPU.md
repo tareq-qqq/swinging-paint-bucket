@@ -7,7 +7,7 @@ ceiling of the CPU solver — the GPU runs every particle in parallel and reache
 
 The **algorithm is identical** to the CPU 3D solver ([`FluidSim3D.cs`](FluidSim3D.cs)) — read
 [`FluidSim.md`](FluidSim.md) for the SPH theory and [`From2DTo3D.md`](From2DTo3D.md) for the 3D
-specifics. Only the *execution model* changes: instead of `Parallel.For` over CPU cores, each GPU
+specifics. Only the _execution model_ changes: instead of `Parallel.For` over CPU cores, each GPU
 thread handles one particle, and the neighbour grid is sorted on the GPU. The CPU files are kept as
 the readable reference; this is the high-count path.
 
@@ -30,14 +30,14 @@ density, pressure, viscosity, collision, rendering, **and** temperature/humidity
 
 ## CPU pass → GPU kernel (one-to-one)
 
-| CPU method (`FluidSim3D.cs`) | GPU kernel (`FluidCompute.compute`) |
-|---|---|
-| `ApplyGravityAndPredict` | `ExternalForces` |
+| CPU method (`FluidSim3D.cs`)                                         | GPU kernel (`FluidCompute.compute`)                      |
+| -------------------------------------------------------------------- | -------------------------------------------------------- |
+| `ApplyGravityAndPredict`                                             | `ExternalForces`                                         |
 | `UpdateSpatialHash` (build keys + `Array.Sort` + `CalculateOffsets`) | `UpdateSpatialHash` + `BitonicSort` + `CalculateOffsets` |
-| `ComputeDensities` | `CalculateDensities` |
-| `ApplyPressureForces` | `CalculatePressureForce` |
-| `ApplyViscosity` | `CalculateViscosity` |
-| `IntegrateAndResolveCollisions` | `UpdatePositions` |
+| `ComputeDensities`                                                   | `CalculateDensities`                                     |
+| `ApplyPressureForces`                                                | `CalculatePressureForce`                                 |
+| `ApplyViscosity`                                                     | `CalculateViscosity`                                     |
+| `IntegrateAndResolveCollisions`                                      | `UpdatePositions`                                        |
 
 Each `FixedUpdate`, the driver sub-steps `iterationsPerFrame`× and dispatches the kernels in that
 order. Kernel constants (smoothing radius, the 3D kernel normalisation scales, rest density, etc.)
@@ -49,13 +49,13 @@ are set as uniforms every step, so Inspector tuning is live.
 
 All particle state lives in `ComputeBuffer`s on the GPU (never copied back per frame):
 
-| Buffer | Type | Size | Holds |
-|---|---|---|---|
-| `Positions`, `PredictedPositions`, `Velocities` | float3 | N | particle state |
-| `Densities` | float2 | N | (density, near-density) |
-| `SpatialKeys` | uint | N→pow2 | each particle's hashed cell key |
-| `SpatialIndices` | uint | N→pow2 | particle index, sorted alongside the keys |
-| `CellStart` | uint | N | first sorted slot for each cell key |
+| Buffer                                          | Type   | Size   | Holds                                     |
+| ----------------------------------------------- | ------ | ------ | ----------------------------------------- |
+| `Positions`, `PredictedPositions`, `Velocities` | float3 | N      | particle state                            |
+| `Densities`                                     | float2 | N      | (density, near-density)                   |
+| `SpatialKeys`                                   | uint   | N→pow2 | each particle's hashed cell key           |
+| `SpatialIndices`                                | uint   | N→pow2 | particle index, sorted alongside the keys |
+| `CellStart`                                     | uint   | N      | first sorted slot for each cell key       |
 
 `N` = `particleCount`. The two sort buffers are padded up to the next **power of two** (the bitonic
 sort needs that); padded entries get key `0xFFFFFFFF` so they sort to the end and are ignored.
@@ -95,7 +95,7 @@ lights. (Velocity/colour wiring is left as a hook for the colour-mixing phase.)
 
 ## Things worth knowing (for the prof discussion)
 
-- **Why bitonic sort:** it's a data-independent sorting *network* — the comparisons in each stage
+- **Why bitonic sort:** it's a data-independent sorting _network_ — the comparisons in each stage
   are fixed and independent, so all threads do useful work with no divergence. That's what makes
   sorting fast on a GPU (a regular quicksort would serialise).
 - **Viscosity race:** `CalculateViscosity` reads neighbours' `Velocities[j]` while other threads

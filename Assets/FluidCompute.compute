@@ -18,6 +18,8 @@
 #pragma kernel CalculateViscosity
 #pragma kernel MixColors
 #pragma kernel UpdatePositions
+#pragma kernel CanvasContact
+#pragma kernel CanvasCommit
 
 // ---------------------------------------------------------------------------------
 //  Buffers
@@ -29,6 +31,20 @@ RWStructuredBuffer<float2> Densities;       // x = density, y = near-density
 RWStructuredBuffer<float> Wetness;          // 1 = wet, 0 = cured (temperature/humidity/exposure)
 RWStructuredBuffer<float3> Colors;          // per-particle pigment RGB (two paints, blended by MixColors)
 RWStructuredBuffer<uint> Released;          // 1 once a particle has drained out the bucket hole (no longer collides with the bucket)
+RWStructuredBuffer<uint> Absorbed;          // 1 once a particle has soaked INTO an absorbent canvas (removed from the sim + render)
+
+// Canvas / surface staining (Phase 5 — only bound & dispatched when a PaintCanvas is assigned).
+// The deposit map is a flat resX*resY grid of CANVAS_STRIDE uints per texel, split into a DRY
+// (committed) layer and a WET (active) layer so fresh paint can cover DRIED paint (wet-on-dry) but
+// blend into still-WET paint (Phase 5b). Per texel:
+//   [0..2] dry RGB  (an alpha-over-composited colour, fixed-point 0..1 * DEPOSIT_SCALE)
+//   [3]    dry opacity (fixed-point 0..1)
+//   [4..6] wet RGB  (additive weighted SUM from drips, via InterlockedAdd)
+//   [7]    wet weight (fixed-point)
+//   [8]    wet dryness (0 = just painted -> 1 = dried; CanvasCommit ages this and commits the layer)
+#define CANVAS_STRIDE 9u
+RWStructuredBuffer<uint> CanvasDeposit;
+StructuredBuffer<float3> MixLut;            // t -> displayed colour (same CPU-baked LUT the particles use)
 
 // Spatial hash (sorted by cell key). Sized to a power of two for the bitonic sort;
 // padded entries carry key 0xFFFFFFFF so they sort to the end and are ignored.
@@ -88,12 +104,43 @@ float cylinderFloorY;       // local Y of the floor (= -cylinderHeight/2)
 float holeRadius;           // radius of the floor spill-hole paint drains through
 int openTop;                // 1 = paint may leave over the rim; 0 = sealed lid
 
+// Canvas / surface (Phase 5). The canvas is a finite quad in ITS local XZ plane (normal = local
+// +Y), so an un-rotated canvas is a horizontal table the drips land on; rotate it for an easel.
+float4x4 canvasWorldToLocal;
+float4x4 canvasLocalToWorld;
+float canvasWidth;          // local-X extent of the quad
+float canvasHeight;         // local-Z extent of the quad
+float canvasContactDist;    // half-thickness of the contact band around the surface plane
+float canvasSurfaceOffset;  // rest height above the plane = particle radius (paint sits ON TOP)
+float canvasBrushRadius;    // world radius each drip stamps into the deposit map (continuous strokes)
+int canvasResX;             // deposit-map resolution
+int canvasResY;
+int mixLutSize;             // entries in MixLut
+// Per-material coefficients (from the SurfaceType preset on PaintCanvas). 0..1 each.
+float canvasAbsorbency;     // porosity -> Darcy permeability k (canvas/paper high, steel ~0)
+float canvasWettability;    // -> contact-angle cosine (Young): 1 wets/spreads, 0 beads (steel)
+float canvasAdhesion;       // surface energy: how strongly a surface film grips / stains
+float canvasFriction;       // roughness -> tangential grip
+// Physics constants (lumped, good defaults on PaintCanvas — rarely changed).
+float canvasCapillary;      // Young-Laplace 2*surfaceTension/poreRadius, lumped (capillary suction)
+float canvasViscousDrag;    // how strongly the paint's viscosity (Darcy mu) resists absorption
+float canvasSaturation;     // how strongly a filled texel chokes further absorption (Washburn slow-down)
+float canvasFilmRate;       // surface-film staining rate (grip left on a non-absorbing surface)
+float canvasFrictionRate;   // scales friction -> per-second tangential damping
+float canvasDryBase;        // base rate the wet canvas layer dries & commits (scaled by temp/humidity/absorbency)
+float canvasOpacityBuildup; // paint weight for full opacity (matches the shader's _Coverage), used when compositing
+
 // Bitonic sort stage parameters.
 uint groupWidth;
 uint groupHeight;
 uint stepIndex;
 
 static const uint INVALID = 0xFFFFFFFF;
+
+// Fixed-point scale for the canvas deposit map: floats in [0,1] are stored as uints (× this) so
+// contributions from many particles can be summed atomically with InterlockedAdd. The canvas
+// shader divides back out. Must match _DepositScale in PaintCanvasSurface.shader.
+static const float DEPOSIT_SCALE = 1024.0;
 
 // Three large primes to mix the integer cell coordinates (matches the CPU version).
 static const uint HashK1 = 15823;
@@ -138,6 +185,7 @@ void ExternalForces(uint3 id : SV_DispatchThreadID)
 {
     if (id.x >= numParticles) return;
     uint i = id.x;
+    if (Absorbed[i] != 0) return; // soaked into the canvas — frozen, no longer simulated
 
     float3 v = Velocities[i] + gravity * deltaTime;
     Velocities[i] = v;
@@ -162,6 +210,12 @@ void UpdateSpatialHash(uint3 id : SV_DispatchThreadID)
     }
 
     CellStart[i] = INVALID;         // reset offsets for this frame
+    if (Absorbed[i] != 0)
+    {
+        SpatialKeys[i] = INVALID;   // soaked-in paint sorts to the end and is never found as a neighbour
+        SpatialIndices[i] = i;
+        return;
+    }
     uint key = KeyFromHash(HashCell(CellCoord(PredictedPositions[i])));
     SpatialKeys[i] = key;
     SpatialIndices[i] = i;
@@ -220,6 +274,7 @@ void CalculateDensities(uint3 id : SV_DispatchThreadID)
 {
     if (id.x >= numParticles) return;
     uint i = id.x;
+    if (Absorbed[i] != 0) return; // soaked into the canvas — excluded from the sim
     uint relI = Released[i]; // paint still in the bucket (0) and drained paint (1) are separate fluids
 
     float3 pos = PredictedPositions[i];
@@ -294,6 +349,7 @@ void CalculatePressureForce(uint3 id : SV_DispatchThreadID)
 {
     if (id.x >= numParticles) return;
     uint i = id.x;
+    if (Absorbed[i] != 0) return; // soaked into the canvas — excluded from the sim
     uint relI = Released[i];
 
     float densityI = Densities[i].x;
@@ -351,6 +407,7 @@ void CalculateViscosity(uint3 id : SV_DispatchThreadID)
 {
     if (id.x >= numParticles) return;
     uint i = id.x;
+    if (Absorbed[i] != 0) return; // soaked into the canvas — excluded from the sim
     uint relI = Released[i];
 
     float3 pos = PredictedPositions[i];
@@ -401,6 +458,7 @@ void MixColors(uint3 id : SV_DispatchThreadID)
     // Diffusing t (averaging toward neighbours) is the mixing; the displayed colour comes from a
     // CPU-baked spectral Kubelka-Munk LUT keyed by t (see FluidSimGPU.BuildMixLut). Averaging this
     // scalar keeps the blend in subtractive paint space, so blue + yellow tends to green, not grey.
+    if (Absorbed[i] != 0) return; // soaked into the canvas — excluded from mixing
     uint relI = Released[i];
     float3 pos = PredictedPositions[i];
     float3 velI = Velocities[i];
@@ -465,6 +523,7 @@ void UpdatePositions(uint3 id : SV_DispatchThreadID)
 {
     if (id.x >= numParticles) return;
     uint i = id.x;
+    if (Absorbed[i] != 0) return; // soaked into the canvas — frozen in place
 
     float3 vel = Velocities[i];
 
@@ -548,4 +607,235 @@ void UpdatePositions(uint3 id : SV_DispatchThreadID)
 
     Positions[i] = pos;
     Velocities[i] = vel;
+}
+
+// Stamp `amount` of paint colour `rgb` into the WET layer over a brush disc centred on texel
+// (tx,ty), feathered by a radial falloff, resetting each touched texel's dryness. Used for both the
+// continuous while-wet deposit and the one-time solid mark left when paint dries onto the surface.
+void SplatDeposit(int tx, int ty, float3 rgb, float amount)
+{
+    if (amount <= 1e-5) return;
+
+    float texelW = canvasWidth / canvasResX;   // world units per texel
+    float texelH = canvasHeight / canvasResY;
+    int rx = clamp((int)ceil(canvasBrushRadius / max(texelW, 1e-4)), 0, 8);
+    int ry = clamp((int)ceil(canvasBrushRadius / max(texelH, 1e-4)), 0, 8);
+    float invR = 1.0 / max(canvasBrushRadius, 1e-4);
+
+    for (int by = -ry; by <= ry; by++)
+    for (int bx = -rx; bx <= rx; bx++)
+    {
+        int px = tx + bx;
+        int py = ty + by;
+        if (px < 0 || px >= canvasResX || py < 0 || py >= canvasResY) continue;
+
+        float2 rr = float2(bx * texelW, by * texelH) * invR;
+        float fall = saturate(1.0 - dot(rr, rr)); // 1 at centre -> 0 at the brush edge
+        if (fall <= 0.0) continue;
+
+        uint bidx = ((uint)(py * canvasResX + px)) * CANVAS_STRIDE;
+        float w = amount * fall;
+        InterlockedAdd(CanvasDeposit[bidx + 4u], (uint)(rgb.r * w * DEPOSIT_SCALE));
+        InterlockedAdd(CanvasDeposit[bidx + 5u], (uint)(rgb.g * w * DEPOSIT_SCALE));
+        InterlockedAdd(CanvasDeposit[bidx + 6u], (uint)(rgb.b * w * DEPOSIT_SCALE));
+        InterlockedAdd(CanvasDeposit[bidx + 7u], (uint)(w * DEPOSIT_SCALE));
+        CanvasDeposit[bidx + 8u] = 0u; // freshly wet -> dryness resets
+    }
+}
+
+// =================================================================================
+//  9. Canvas contact — the paint that leaves the bucket lands on the canvas, marks it,
+//     soaks in and dries onto it. Runs AFTER UpdatePositions, only when a PaintCanvas is
+//     assigned, so it's fully optional and never touches the box/bucket demos. One
+//     paint-surface contact drives all four required canvas types via the per-material
+//     coefficients (absorbency / wettability / adhesion / friction). See Surfaces.md.
+// =================================================================================
+[numthreads(64, 1, 1)]
+void CanvasContact(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= numParticles) return;
+    uint i = id.x;
+    if (Absorbed[i] != 0) return; // already soaked in — nothing more to do
+
+    // Only paint that is free of the bucket can reach the canvas. Box demo (no cylinder): every
+    // particle can land on it. Bucket demo: only DRAINED paint (Released) — paint still in the
+    // bucket is held by the walls above and must not be yanked onto a canvas placed below.
+    if (containerIsCylinder != 0 && Released[i] == 0) return;
+
+    float3 pos = Positions[i];
+    float3 vel = Velocities[i];
+
+    // World -> canvas-local. The quad lies in the local XZ plane (normal = local +Y).
+    float3 lp = mul(canvasWorldToLocal, float4(pos, 1)).xyz;
+
+    // Outside the quad footprint -> the drip misses the canvas and keeps falling.
+    float hw = canvasWidth * 0.5;
+    float hh = canvasHeight * 0.5;
+    if (abs(lp.x) > hw || abs(lp.z) > hh) return;
+
+    // The particle SITS ON TOP of the canvas: its centre rests one radius above the plane, so the
+    // sphere isn't sliced in half by the surface (which hid its colour). Contact = it has reached
+    // that rest height. Above it -> still falling, no contact yet. Well below it -> a stray fast
+    // particle that already passed through; leave it.
+    float surfaceY = canvasSurfaceOffset;
+    if (lp.y > surfaceY || lp.y < -canvasContactDist) return;
+
+    float3 lv = mul((float3x3)canvasWorldToLocal, vel);
+
+    // --- Contact angle (Young's equation) ---
+    // Map wettability 0..1 -> contact-angle cosine in [-1,1]: 1 = fully wetting (spreads & soaks),
+    // -1 = fully non-wetting (beads & bounces, e.g. steel), 0.5 -> 90 deg (neutral). Only a wetting
+    // surface (cos > 0) develops capillary suction; a non-wetting one repels the paint.
+    float cosTheta = 2.0 * canvasWettability - 1.0;
+    float wetting = saturate(cosTheta);
+
+    // --- Impact: resolve the surface collision (impulse / restitution) in the canvas's local frame ---
+    lp.y = surfaceY; // sit the particle ON TOP of the surface (centre one radius above the plane)
+    // Restitution is set by wetting: a wetting surface kills the normal bounce (paint sticks flat &
+    // spreads); a non-wetting surface keeps it (the drop beads and rebounds).
+    if (lv.y < 0.0)
+        lv.y = -lv.y * collisionDamping * (1.0 - wetting);
+    // Roughness friction: rough surfaces grip and stop the paint spreading; smooth steel lets it slide.
+    lv.xz *= max(0.0, 1.0 - canvasFriction * canvasFrictionRate * deltaTime);
+
+    // Texel this contact maps to (shared by the saturation read and the deposit write below).
+    float u = lp.x / canvasWidth + 0.5;
+    float v = lp.z / canvasHeight + 0.5;
+    int tx = clamp((int)(u * canvasResX), 0, canvasResX - 1);
+    int ty = clamp((int)(v * canvasResY), 0, canvasResY - 1);
+    uint idx = ((uint)(ty * canvasResX + tx)) * CANVAS_STRIDE;
+
+    // --- Capillary absorption into the pores (Young-Laplace + Darcy + Lucas-Washburn) ---
+    // How full this patch of surface already is (dry opacity + current wet weight). Darcy's flux
+    // falls as the wetted front deepens/saturates, so absorption is fast at first then slows ->
+    // Washburn's penetration ~ sqrt(t), and a very porous paper eventually saturates and bleeds.
+    float localSat = (CanvasDeposit[idx + 3u] + CanvasDeposit[idx + 7u]) / DEPOSIT_SCALE;
+    // Young-Laplace capillary suction  ~ 2*surfaceTension*cos(theta)/poreRadius  (lumped constant).
+    float capPressure = canvasCapillary * wetting;
+    // Darcy flux  q = (k / mu) * P : porosity = permeability k = absorbency; the paint's own
+    // viscosity (mu = effectiveViscosity) resists; saturation chokes it. Thicker paint soaks slower.
+    float viscFactor = 1.0 / (1.0 + canvasViscousDrag * effectiveViscosity);
+    float flux = canvasAbsorbency * capPressure * viscFactor / (1.0 + canvasSaturation * localSat);
+    float absorbed = min(Wetness[i], flux * deltaTime); // can't soak in more liquid than the drop holds
+    Wetness[i] = max(0.0, Wetness[i] - absorbed);
+
+    // --- Stain: pigment left in the surface = what soaked in (absorbed) + a thin film that grips on
+    // top via surface energy (adhesion) even on a non-absorbing surface. Dry paint adds nothing new,
+    // so a mark stops darkening once it has set. Steel: absorbed~0 and adhesion~0 -> it barely marks.
+    float depositW = absorbed + canvasAdhesion * Wetness[i] * canvasFilmRate * deltaTime;
+    if (depositW > 1e-5)
+    {
+        // Deposited colour = the particle's DISPLAYED colour: its mix fraction t through the same
+        // spectral Kubelka-Munk LUT the particles render with, so the artwork matches the paint.
+        int li = clamp((int)(Colors[i].x * (mixLutSize - 1) + 0.5), 0, mixLutSize - 1);
+        float3 rgb = MixLut[li];
+
+        // Stamp the deposit over a BRUSH DISC the size of the particle (not a single texel) so the
+        // drips lay down CONTINUOUS strokes instead of a speckle of dots (a single particle is many
+        // texels wide). A radial falloff feathers each stamp so overlapping stamps read as smooth paint.
+        float texelW = canvasWidth / canvasResX;   // world units per texel
+        float texelH = canvasHeight / canvasResY;
+        int rx = clamp((int)ceil(canvasBrushRadius / max(texelW, 1e-4)), 0, 8);
+        int ry = clamp((int)ceil(canvasBrushRadius / max(texelH, 1e-4)), 0, 8);
+        float invR = 1.0 / max(canvasBrushRadius, 1e-4);
+
+        for (int by = -ry; by <= ry; by++)
+        for (int bx = -rx; bx <= rx; bx++)
+        {
+            int px = tx + bx;
+            int py = ty + by;
+            if (px < 0 || px >= canvasResX || py < 0 || py >= canvasResY) continue;
+
+            // Radial falloff across the brush: 1 at the centre -> 0 at the edge of the disc.
+            float2 rr = float2(bx * texelW, by * texelH) * invR;
+            float fall = saturate(1.0 - dot(rr, rr));
+            if (fall <= 0.0) continue;
+
+            uint bidx = ((uint)(py * canvasResX + px)) * CANVAS_STRIDE;
+            float w = depositW * fall;
+            // Into the WET (active) layer [4..7]: the drip mixes with still-wet paint here (wet-on-
+            // wet) until CanvasCommit dries it onto the dry layer. Reset this texel's dryness so it
+            // counts as freshly wet again (many threads write 0 — same value, so the race is benign).
+            InterlockedAdd(CanvasDeposit[bidx + 4u], (uint)(rgb.r * w * DEPOSIT_SCALE));
+            InterlockedAdd(CanvasDeposit[bidx + 5u], (uint)(rgb.g * w * DEPOSIT_SCALE));
+            InterlockedAdd(CanvasDeposit[bidx + 6u], (uint)(rgb.b * w * DEPOSIT_SCALE));
+            InterlockedAdd(CanvasDeposit[bidx + 7u], (uint)(w * DEPOSIT_SCALE));
+            CanvasDeposit[bidx + 8u] = 0u; // freshly wet -> dryness resets
+        }
+    }
+
+    // --- Set behaviour: once the paint has given its liquid up to the surface (Wetness ~ 0) ---
+    if (Wetness[i] <= setWetnessThreshold)
+    {
+        // On a POROUS surface the drop has SOAKED IN — flag it Absorbed so it's removed from the sim
+        // and hidden (its pigment is already in the deposit map), so no pile of spheres builds up.
+        // On a non-absorbing surface like steel (absorbency ~ 0) it can't soak in: it stays as a
+        // dried BEAD on top, pinned in the canvas frame by adhesion (rides with a moving canvas).
+        if (canvasAbsorbency > 0.25)
+            Absorbed[i] = 1;
+        else
+            lv *= (1.0 - canvasAdhesion);
+    }
+
+    // Canvas-local -> world.
+    pos = mul(canvasLocalToWorld, float4(lp, 1)).xyz;
+    vel = mul((float3x3)canvasLocalToWorld, lv);
+    Positions[i] = pos;
+    Velocities[i] = vel;
+}
+
+// =================================================================================
+//  10. Canvas commit — dry the WET layer and, once dried, composite it OVER the dry layer.
+//      One thread per texel (no race, single owner), dispatched after CanvasContact. This is
+//      what makes layering real: fresh paint on a DRIED spot covers it (a new top layer), while
+//      fresh paint on still-WET paint keeps blending (it stays in the wet layer). Drying speed is
+//      driven by the environment (hot/dry/absorbent dries & covers sooner; humid stays wet longer).
+//      See Surfaces.md.
+// =================================================================================
+[numthreads(64, 1, 1)]
+void CanvasCommit(uint3 id : SV_DispatchThreadID)
+{
+    uint t = id.x;
+    if (t >= (uint)(canvasResX * canvasResY)) return;
+    uint base = t * CANVAS_STRIDE;
+
+    float wetW = CanvasDeposit[base + 7u] / DEPOSIT_SCALE;
+    if (wetW <= 0.0) return; // nothing wet here
+
+    // Advance dryness. Hot + dry air and a porous surface dry (and therefore COVER) faster; humid air
+    // keeps the layer wet longer so it keeps blending. Reuses the ambient temperature/humidity inputs.
+    float tempFactor = saturate(ambientTemperature / 40.0);
+    float dryRate = canvasDryBase * (0.3 + tempFactor) * (1.0 - humidity) * (0.5 + canvasAbsorbency);
+    float dryness = CanvasDeposit[base + 8u] / DEPOSIT_SCALE + dryRate * deltaTime;
+
+    if (dryness < 1.0)
+    {
+        CanvasDeposit[base + 8u] = (uint)(saturate(dryness) * DEPOSIT_SCALE);
+        return;
+    }
+
+    // Dried: composite the wet layer OVER the dry layer (alpha-over — the top colour wins, it does
+    // not average into the layer below), then clear the wet layer so the next drips start a fresh top.
+    float3 wetCol = float3(CanvasDeposit[base + 4u], CanvasDeposit[base + 5u], CanvasDeposit[base + 6u])
+                    / max((float)CanvasDeposit[base + 7u], 1.0);
+    float wetOpacity = saturate(wetW / max(canvasOpacityBuildup, 0.001));
+
+    float3 dryCol = float3(CanvasDeposit[base + 0u], CanvasDeposit[base + 1u], CanvasDeposit[base + 2u]) / DEPOSIT_SCALE;
+    float dryOpacity = CanvasDeposit[base + 3u] / DEPOSIT_SCALE;
+
+    // Standard "source-over" of the wet layer onto the dry layer (premultiplied, then un-premultiply
+    // back to a straight colour). Wet paint covers the dry layer; a semi-transparent layer doesn't
+    // darken the colour (the bug a plain lerp would introduce when opacity < 1).
+    float outOpacity = wetOpacity + dryOpacity * (1.0 - wetOpacity);
+    float3 outCol = (wetCol * wetOpacity + dryCol * dryOpacity * (1.0 - wetOpacity)) / max(outOpacity, 1e-4);
+
+    CanvasDeposit[base + 0u] = (uint)(saturate(outCol.r) * DEPOSIT_SCALE);
+    CanvasDeposit[base + 1u] = (uint)(saturate(outCol.g) * DEPOSIT_SCALE);
+    CanvasDeposit[base + 2u] = (uint)(saturate(outCol.b) * DEPOSIT_SCALE);
+    CanvasDeposit[base + 3u] = (uint)(saturate(outOpacity) * DEPOSIT_SCALE);
+    CanvasDeposit[base + 4u] = 0u;
+    CanvasDeposit[base + 5u] = 0u;
+    CanvasDeposit[base + 6u] = 0u;
+    CanvasDeposit[base + 7u] = 0u;
+    CanvasDeposit[base + 8u] = 0u;
 }

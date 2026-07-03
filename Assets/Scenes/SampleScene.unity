@@ -331,10 +331,10 @@ MonoBehaviour:
   particleSpacing: 0.15
   spawnCentre: {x: 0, y: 0, z: 0}
   spawnJitter: 0.02
-  smoothingRadius: 0.5
+  smoothingRadius: 0.34
   restDensity: 12
   pressureMultiplier: 200
-  nearPressureMultiplier: 13
+  nearPressureMultiplier: 50
   viscosityStrength: 0.12
   autoCalibrateRestDensity: 1
   collisionDamping: 0.45
@@ -348,15 +348,16 @@ MonoBehaviour:
   boundsSize: {x: 10, y: 10, z: 10}
   container: {fileID: 646856881}
   boundsVisual: {fileID: 0}
-  iterationsPerFrame: 2
-  minStableFramerate: 30
+  canvas: {fileID: 1059329504}
+  stabilityCFL: 0.02
+  maxSubsteps: 6
   enableColorMixing: 1
-  paintColorA: {r: 0.1, g: 0.2, b: 0.85, a: 1}
-  paintColorB: {r: 0.95, g: 0.85, b: 0.1, a: 1}
+  paintColorA: {r: 0.10196077, g: 0.7846359, b: 0.8509804, a: 1}
+  paintColorB: {r: 1, g: 0.9481351, b: 0.5518868, a: 1}
   mixVibrance: 0.45
   colorMixRate: 1
   shakeMixBoost: 0.5
-  particleScale: 0.12
+  particleScale: 0.13
 --- !u!4 &646856880
 Transform:
   m_ObjectHideFlags: 0
@@ -386,7 +387,7 @@ MonoBehaviour:
   m_EditorClassIdentifier: Assembly-CSharp::BucketContainer
   bucket: {fileID: 1888754126}
   openTop: 1
-  fillFraction: 0.953
+  fillFraction: 0.308
 --- !u!1 &705507993
 GameObject:
   m_ObjectHideFlags: 0
@@ -626,6 +627,73 @@ Transform:
   m_Children: []
   m_Father: {fileID: 0}
   m_LocalEulerAnglesHint: {x: 15.733, y: 0, z: 0}
+--- !u!1 &1059329503
+GameObject:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  serializedVersion: 6
+  m_Component:
+  - component: {fileID: 1059329505}
+  - component: {fileID: 1059329504}
+  m_Layer: 0
+  m_Name: Canvas
+  m_TagString: Untagged
+  m_Icon: {fileID: 0}
+  m_NavMeshLayer: 0
+  m_StaticEditorFlags: 0
+  m_IsActive: 1
+--- !u!114 &1059329504
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1059329503}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: af0e8be6380b414caad6005961abfd25, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: Assembly-CSharp::PaintCanvas
+  surfaceType: 2
+  applyPreset: 1
+  absorbency: 0.4
+  wettability: 0.55
+  adhesion: 0.55
+  friction: 0.55
+  width: 12
+  height: 12
+  contactThickness: 0.3
+  resolution: 384
+  exportResolution: 2048
+  baseColor: {r: 0.72, g: 0.55, b: 0.35, a: 1}
+  opacityBuildup: 0.8
+  vividness: 1.6
+  brushRadius: 0.1
+  capillaryStrength: 3
+  viscousDrag: 2
+  saturationChoke: 6
+  filmRate: 0.4
+  frictionRate: 12
+  layerDryRate: 0.6
+  exportKey: 30
+  saveFolder: 
+--- !u!4 &1059329505
+Transform:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1059329503}
+  serializedVersion: 2
+  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalPosition: {x: -2.17093, y: -11.28, z: 0.31}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+  m_ConstrainProportionsScale: 0
+  m_Children: []
+  m_Father: {fileID: 0}
+  m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
 --- !u!1 &1198570909
 GameObject:
   m_ObjectHideFlags: 0
@@ -889,8 +957,9 @@ MonoBehaviour:
   boundsSize: {x: 10, y: 10, z: 10}
   container: {fileID: 0}
   boundsVisual: {fileID: 0}
-  iterationsPerFrame: 2
-  minStableFramerate: 30
+  canvas: {fileID: 0}
+  stabilityCFL: 0.02
+  maxSubsteps: 8
   enableColorMixing: 1
   paintColorA: {r: 0, g: 0, b: 1, a: 1}
   paintColorB: {r: 1, g: 1, b: 1, a: 1}
@@ -975,10 +1044,10 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::BucketSystem
   bucketMass: 0.5
-  bucketRadius: 1.5
-  bucketHeight: 4
+  bucketRadius: 3
+  bucketHeight: 6
   bucketFloorY: -0.175
-  holeRadius: 0
+  holeRadius: 0.5
   pendulum: {fileID: 64464981}
 --- !u!4 &1888754127
 Transform:
@@ -1026,3 +1095,4 @@ SceneRoots:
   - {fileID: 646856880}
   - {fileID: 1888754127}
   - {fileID: 824018235}
+  - {fileID: 1059329505}

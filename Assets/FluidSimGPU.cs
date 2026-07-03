@@ -91,6 +91,12 @@ public class FluidSimGPU : MonoBehaviour
     )]
     public GameObject boundsVisual;
 
+    [Header("Canvas (optional)")]
+    [Tooltip(
+        "OPTIONAL. Assign a PaintCanvas and the paint that leaves the bucket (or, in the box demo, any paint) lands on it, stains it, soaks in and dries onto it (Phase 5 — surfaces). Leave empty and nothing changes."
+    )]
+    public PaintCanvas canvas;
+
     [Header("Simulation (stability)")]
     [Tooltip(
         "Stability: the physics timestep is capped at this × Smoothing Radius. LOWER it if paint explodes (at the rim/hole, on a slow machine, or with small particles) — the sim runs more substeps at a smaller, stable step. 0.02 is a good start."
@@ -143,6 +149,7 @@ public class FluidSimGPU : MonoBehaviour
     ComputeBuffer wetnessBuf; // float (1 = wet, 0 = cured)
     ComputeBuffer colorsBuf; // float3: .x = mix fraction t (0=paint A, 1=paint B)
     ComputeBuffer releasedBuf; // uint: 1 once a particle has drained out the bucket hole
+    ComputeBuffer absorbedBuf; // uint: 1 once a particle has soaked into an absorbent canvas (removed)
     ComputeBuffer mixLutBuf; // float3 LUT: t -> displayed colour (spectral Kubelka-Munk)
     const int MixLutSize = 64;
     Color lutColorA,
@@ -161,7 +168,9 @@ public class FluidSimGPU : MonoBehaviour
         kPressure,
         kViscosity,
         kMixColors,
-        kUpdatePositions;
+        kUpdatePositions,
+        kCanvasContact,
+        kCanvasCommit;
 
     int numParticles;
     int paddedCount; // next power of two >= numParticles (for the bitonic sort)
@@ -282,6 +291,8 @@ public class FluidSimGPU : MonoBehaviour
         kViscosity = compute.FindKernel("CalculateViscosity");
         kMixColors = compute.FindKernel("MixColors");
         kUpdatePositions = compute.FindKernel("UpdatePositions");
+        kCanvasContact = compute.FindKernel("CanvasContact");
+        kCanvasCommit = compute.FindKernel("CanvasCommit");
     }
 
     void InitBuffers()
@@ -317,6 +328,7 @@ public class FluidSimGPU : MonoBehaviour
         wetnessBuf = new ComputeBuffer(numParticles, sizeof(float));
         colorsBuf = new ComputeBuffer(numParticles, sizeof(float) * 3);
         releasedBuf = new ComputeBuffer(numParticles, sizeof(uint)); // all 0 (captured) by default
+        absorbedBuf = new ComputeBuffer(numParticles, sizeof(uint)); // all 0 (active) by default
         spatialKeysBuf = new ComputeBuffer(paddedCount, sizeof(uint));
         spatialIndicesBuf = new ComputeBuffer(paddedCount, sizeof(uint));
         cellStartBuf = new ComputeBuffer(numParticles, sizeof(uint));
@@ -355,6 +367,7 @@ public class FluidSimGPU : MonoBehaviour
         wetnessBuf.SetData(wet);
         colorsBuf.SetData(colors);
         releasedBuf.SetData(new uint[numParticles]); // all 0 = all paint starts captured by the bucket
+        absorbedBuf.SetData(new uint[numParticles]); // all 0 = no paint has soaked into the canvas yet
 
         BuildMixLut();
     }
@@ -373,6 +386,7 @@ public class FluidSimGPU : MonoBehaviour
         predictedBuf.SetData(positions);
         velocitiesBuf.SetData(new Vector3[numParticles]); // reset to rest
         releasedBuf.SetData(new uint[numParticles]); // freshly placed paint is captured again
+        absorbedBuf.SetData(new uint[numParticles]); // freshly placed paint is active again
     }
 
     void SpawnInGrid(Vector3[] positions, Vector3[] velocities)
@@ -457,6 +471,34 @@ public class FluidSimGPU : MonoBehaviour
         compute.SetBuffer(kUpdatePositions, "Positions", positionsBuf);
         compute.SetBuffer(kUpdatePositions, "Velocities", velocitiesBuf);
         compute.SetBuffer(kUpdatePositions, "Released", releasedBuf);
+
+        // Absorbed — soaked-into-canvas paint is skipped by every per-particle kernel and excluded
+        // from the neighbour search (via UpdateSpatialHash), so it's removed from the sim entirely.
+        compute.SetBuffer(kExternalForces, "Absorbed", absorbedBuf);
+        compute.SetBuffer(kUpdateHash, "Absorbed", absorbedBuf);
+        compute.SetBuffer(kDensities, "Absorbed", absorbedBuf);
+        compute.SetBuffer(kPressure, "Absorbed", absorbedBuf);
+        compute.SetBuffer(kViscosity, "Absorbed", absorbedBuf);
+        compute.SetBuffer(kMixColors, "Absorbed", absorbedBuf);
+        compute.SetBuffer(kUpdatePositions, "Absorbed", absorbedBuf);
+
+        // CanvasContact + CanvasCommit (optional) — only bound when a PaintCanvas is assigned, so the
+        // box/bucket demos never touch them. Contact needs the paint state + deposit map + colour LUT;
+        // commit only touches the deposit map.
+        if (canvas != null && canvas.Active)
+        {
+            canvas.EnsureResources(); // make sure the deposit buffer exists before we bind it
+            compute.SetBuffer(kCanvasContact, "Positions", positionsBuf);
+            compute.SetBuffer(kCanvasContact, "Velocities", velocitiesBuf);
+            compute.SetBuffer(kCanvasContact, "Colors", colorsBuf);
+            compute.SetBuffer(kCanvasContact, "Wetness", wetnessBuf);
+            compute.SetBuffer(kCanvasContact, "Released", releasedBuf);
+            compute.SetBuffer(kCanvasContact, "Absorbed", absorbedBuf);
+            compute.SetBuffer(kCanvasContact, "MixLut", mixLutBuf);
+            compute.SetBuffer(kCanvasContact, "CanvasDeposit", canvas.DepositBuffer);
+
+            compute.SetBuffer(kCanvasCommit, "CanvasDeposit", canvas.DepositBuffer);
+        }
     }
 
     // =================================================================================
@@ -478,6 +520,14 @@ public class FluidSimGPU : MonoBehaviour
         if (enableColorMixing)
             Dispatch(kMixColors, numParticles);
         Dispatch(kUpdatePositions, numParticles);
+
+        // Canvas contact runs last (needs final positions/velocities) and only when a canvas exists;
+        // the commit pass then dries the wet layer and composites it (over one thread per texel).
+        if (canvas != null && canvas.Active)
+        {
+            Dispatch(kCanvasContact, numParticles);
+            Dispatch(kCanvasCommit, canvas.ResX * canvas.ResY);
+        }
     }
 
     void SetUniforms(float dt)
@@ -563,6 +613,42 @@ public class FluidSimGPU : MonoBehaviour
             compute.SetFloat("cylinderFloorY", container.FloorY);
             compute.SetFloat("holeRadius", container.HoleRadius);
             compute.SetInt("openTop", container.OpenTop ? 1 : 0);
+        }
+
+        // Canvas (Phase 5). Pose + finite quad + per-material coefficients + the wetting/absorption
+        // physics constants, consumed by the CanvasContact kernel (only dispatched when a canvas is
+        // assigned). The quad lies in the canvas's local XZ plane (normal = local +Y).
+        if (canvas != null && canvas.Active)
+        {
+            Transform cv = canvas.Pose;
+            Matrix4x4 cToWorld = Matrix4x4.TRS(cv.position, cv.rotation, Vector3.one);
+            compute.SetMatrix("canvasLocalToWorld", cToWorld);
+            compute.SetMatrix("canvasWorldToLocal", cToWorld.inverse);
+            compute.SetFloat("canvasWidth", canvas.Width);
+            compute.SetFloat("canvasHeight", canvas.Height);
+            compute.SetFloat("canvasContactDist", canvas.ContactThickness);
+            // The sphere mesh has radius 0.5, drawn at particleScale — so the paint's world radius is
+            // 0.5*particleScale. Rest the particle centre that far above the canvas so it sits on top.
+            compute.SetFloat("canvasSurfaceOffset", 0.5f * particleScale);
+            compute.SetFloat("canvasBrushRadius", canvas.BrushRadius);
+            compute.SetInt("canvasResX", canvas.ResX);
+            compute.SetInt("canvasResY", canvas.ResY);
+            compute.SetInt("mixLutSize", MixLutSize);
+
+            compute.SetFloat("canvasAbsorbency", canvas.absorbency);
+            compute.SetFloat("canvasWettability", canvas.wettability);
+            compute.SetFloat("canvasAdhesion", canvas.adhesion);
+            compute.SetFloat("canvasFriction", canvas.friction);
+            compute.SetFloat("canvasCapillary", canvas.capillaryStrength);
+            compute.SetFloat("canvasViscousDrag", canvas.viscousDrag);
+            compute.SetFloat("canvasSaturation", canvas.saturationChoke);
+            compute.SetFloat("canvasFilmRate", canvas.filmRate);
+            compute.SetFloat("canvasFrictionRate", canvas.frictionRate);
+            // Layering (CanvasCommit): drying/commit rate + the opacity-buildup the shader uses, so
+            // the commit computes wet opacity the same way the display does. Temperature/humidity are
+            // already set above (shared with the paint drying).
+            compute.SetFloat("canvasDryBase", canvas.layerDryRate);
+            compute.SetFloat("canvasOpacityBuildup", Mathf.Max(0.01f, canvas.opacityBuildup));
         }
     }
 
@@ -778,6 +864,7 @@ public class FluidSimGPU : MonoBehaviour
         particleMaterial.SetBuffer("Positions", positionsBuf);
         particleMaterial.SetBuffer("Colors", colorsBuf); // .x = per-particle mix fraction t
         particleMaterial.SetBuffer("MixLut", mixLutBuf); // t -> spectral Kubelka-Munk colour
+        particleMaterial.SetBuffer("Absorbed", absorbedBuf); // soaked-in paint is collapsed/hidden
         particleMaterial.SetInt("MixLutSize", MixLutSize);
         particleMaterial.SetFloat("_Scale", particleScale);
 
@@ -848,6 +935,7 @@ public class FluidSimGPU : MonoBehaviour
         wetnessBuf?.Release();
         colorsBuf?.Release();
         releasedBuf?.Release();
+        absorbedBuf?.Release();
         mixLutBuf?.Release();
         mixLutBuf = null;
         spatialKeysBuf?.Release();
