@@ -649,6 +649,9 @@ public class FluidSimGPU : MonoBehaviour
             // already set above (shared with the paint drying).
             compute.SetFloat("canvasDryBase", canvas.layerDryRate);
             compute.SetFloat("canvasOpacityBuildup", Mathf.Max(0.01f, canvas.opacityBuildup));
+            compute.SetFloat("canvasSetStamp", Mathf.Max(0f, canvas.driedMarkStrength));
+            compute.SetFloat("canvasBounce", Mathf.Clamp01(canvas.bounce));
+            compute.SetFloat("canvasContactDry", Mathf.Max(0f, canvas.contactDryRate));
         }
     }
 

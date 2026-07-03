@@ -129,6 +129,9 @@ float canvasFilmRate;       // surface-film staining rate (grip left on a non-ab
 float canvasFrictionRate;   // scales friction -> per-second tangential damping
 float canvasDryBase;        // base rate the wet canvas layer dries & commits (scaled by temp/humidity/absorbency)
 float canvasOpacityBuildup; // paint weight for full opacity (matches the shader's _Coverage), used when compositing
+float canvasSetStamp;       // strength of the solid mark a particle leaves when it dries onto the surface
+float canvasBounce;         // how bouncy paint is on the surface (0 = splat & stick, 1 = fully elastic)
+float canvasContactDry;     // evaporation rate for paint spread ON a surface (temperature/humidity scaled)
 
 // Bitonic sort stage parameters.
 uint groupWidth;
@@ -689,12 +692,12 @@ void CanvasContact(uint3 id : SV_DispatchThreadID)
     float cosTheta = 2.0 * canvasWettability - 1.0;
     float wetting = saturate(cosTheta);
 
-    // --- Impact: resolve the surface collision (impulse / restitution) in the canvas's local frame ---
+    // --- Impact: paint SPLATS and sticks (it's viscous paint, not a bead). Restitution is a small
+    // global bounce factor so it barely rebounds on ANY surface — no marble-ball skittering off steel.
+    // Wettability only feathers off the last bit of that bounce (a wetting surface kills it entirely).
     lp.y = surfaceY; // sit the particle ON TOP of the surface (centre one radius above the plane)
-    // Restitution is set by wetting: a wetting surface kills the normal bounce (paint sticks flat &
-    // spreads); a non-wetting surface keeps it (the drop beads and rebounds).
     if (lv.y < 0.0)
-        lv.y = -lv.y * collisionDamping * (1.0 - wetting);
+        lv.y = -lv.y * canvasBounce * (1.0 - wetting);
     // Roughness friction: rough surfaces grip and stop the paint spreading; smooth steel lets it slide.
     lv.xz *= max(0.0, 1.0 - canvasFriction * canvasFrictionRate * deltaTime);
 
@@ -719,62 +722,33 @@ void CanvasContact(uint3 id : SV_DispatchThreadID)
     float absorbed = min(Wetness[i], flux * deltaTime); // can't soak in more liquid than the drop holds
     Wetness[i] = max(0.0, Wetness[i] - absorbed);
 
-    // --- Stain: pigment left in the surface = what soaked in (absorbed) + a thin film that grips on
-    // top via surface energy (adhesion) even on a non-absorbing surface. Dry paint adds nothing new,
-    // so a mark stops darkening once it has set. Steel: absorbed~0 and adhesion~0 -> it barely marks.
-    float depositW = absorbed + canvasAdhesion * Wetness[i] * canvasFilmRate * deltaTime;
-    if (depositW > 1e-5)
-    {
-        // Deposited colour = the particle's DISPLAYED colour: its mix fraction t through the same
-        // spectral Kubelka-Munk LUT the particles render with, so the artwork matches the paint.
-        int li = clamp((int)(Colors[i].x * (mixLutSize - 1) + 0.5), 0, mixLutSize - 1);
-        float3 rgb = MixLut[li];
+    // --- Contact drying (evaporation on the surface). Paint spread thin ON a surface evaporates far
+    // faster than bulk paint (∝ surface area), driven by temperature/humidity like the ambient pass.
+    // This is why steel — which soaks in nothing — still SETS in a few seconds instead of ~a minute,
+    // after which it stamps its dried mark and adheres. Canvas/paper dry by absorption AND this.
+    float evap = canvasContactDry * saturate(ambientTemperature / 40.0) * (1.0 - humidity) * deltaTime;
+    Wetness[i] = max(0.0, Wetness[i] - evap);
 
-        // Stamp the deposit over a BRUSH DISC the size of the particle (not a single texel) so the
-        // drips lay down CONTINUOUS strokes instead of a speckle of dots (a single particle is many
-        // texels wide). A radial falloff feathers each stamp so overlapping stamps read as smooth paint.
-        float texelW = canvasWidth / canvasResX;   // world units per texel
-        float texelH = canvasHeight / canvasResY;
-        int rx = clamp((int)ceil(canvasBrushRadius / max(texelW, 1e-4)), 0, 8);
-        int ry = clamp((int)ceil(canvasBrushRadius / max(texelH, 1e-4)), 0, 8);
-        float invR = 1.0 / max(canvasBrushRadius, 1e-4);
+    // Deposited colour = the particle's DISPLAYED colour: its mix fraction t through the same
+    // spectral Kubelka-Munk LUT the particles render with, so the artwork matches the paint.
+    int li = clamp((int)(Colors[i].x * (mixLutSize - 1) + 0.5), 0, mixLutSize - 1);
+    float3 rgb = MixLut[li];
 
-        for (int by = -ry; by <= ry; by++)
-        for (int bx = -rx; bx <= rx; bx++)
-        {
-            int px = tx + bx;
-            int py = ty + by;
-            if (px < 0 || px >= canvasResX || py < 0 || py >= canvasResY) continue;
+    // --- Stain (while fluid): what soaked in (absorbed) + a thin film that grips even on a
+    // non-absorbing surface (adhesion). Splatted over a brush disc so drips are continuous strokes.
+    SplatDeposit(tx, ty, rgb, absorbed + canvasAdhesion * Wetness[i] * canvasFilmRate * deltaTime);
 
-            // Radial falloff across the brush: 1 at the centre -> 0 at the edge of the disc.
-            float2 rr = float2(bx * texelW, by * texelH) * invR;
-            float fall = saturate(1.0 - dot(rr, rr));
-            if (fall <= 0.0) continue;
-
-            uint bidx = ((uint)(py * canvasResX + px)) * CANVAS_STRIDE;
-            float w = depositW * fall;
-            // Into the WET (active) layer [4..7]: the drip mixes with still-wet paint here (wet-on-
-            // wet) until CanvasCommit dries it onto the dry layer. Reset this texel's dryness so it
-            // counts as freshly wet again (many threads write 0 — same value, so the race is benign).
-            InterlockedAdd(CanvasDeposit[bidx + 4u], (uint)(rgb.r * w * DEPOSIT_SCALE));
-            InterlockedAdd(CanvasDeposit[bidx + 5u], (uint)(rgb.g * w * DEPOSIT_SCALE));
-            InterlockedAdd(CanvasDeposit[bidx + 6u], (uint)(rgb.b * w * DEPOSIT_SCALE));
-            InterlockedAdd(CanvasDeposit[bidx + 7u], (uint)(w * DEPOSIT_SCALE));
-            CanvasDeposit[bidx + 8u] = 0u; // freshly wet -> dryness resets
-        }
-    }
-
-    // --- Set behaviour: once the paint has given its liquid up to the surface (Wetness ~ 0) ---
+    // --- Set / adhere: once the paint dries in contact (Wetness ~ 0) it leaves a SOLID mark of its
+    // colour on ANY surface (a bit lighter on low-adhesion surfaces like steel), then the particle is
+    // removed. Its colour now lives in the deposit map, which is stored in the canvas's LOCAL frame
+    // and drawn at the canvas transform — so the DRIED MARK RIDES the canvas when it moves/tilts.
+    // THAT is the adhesion: dried paint travels with the surface. Still-wet paint that hasn't set will
+    // slide off a moving surface (correct — wet paint isn't stuck yet). This also means steel/wood
+    // dried paint finally shows in the artwork / screenshot instead of only living as loose particles.
     if (Wetness[i] <= setWetnessThreshold)
     {
-        // On a POROUS surface the drop has SOAKED IN — flag it Absorbed so it's removed from the sim
-        // and hidden (its pigment is already in the deposit map), so no pile of spheres builds up.
-        // On a non-absorbing surface like steel (absorbency ~ 0) it can't soak in: it stays as a
-        // dried BEAD on top, pinned in the canvas frame by adhesion (rides with a moving canvas).
-        if (canvasAbsorbency > 0.25)
-            Absorbed[i] = 1;
-        else
-            lv *= (1.0 - canvasAdhesion);
+        SplatDeposit(tx, ty, rgb, canvasSetStamp * (0.4 + 0.6 * canvasAdhesion));
+        Absorbed[i] = 1;
     }
 
     // Canvas-local -> world.

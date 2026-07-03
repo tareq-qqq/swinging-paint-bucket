@@ -98,14 +98,24 @@ public class PaintCanvas : MonoBehaviour
     [Tooltip("How strongly an already-saturated patch chokes further absorption (Lucas–Washburn slow-down / bleed).")]
     public float saturationChoke = 6f;
 
-    [Tooltip("Rate a thin surface film stains a NON-absorbing surface (grip via adhesion, e.g. paint drying on steel).")]
-    public float filmRate = 0.4f;
+    [Tooltip("Rate wet paint stains the surface on contact (a coloured film, scaled by adhesion). Higher = paint marks more the instant it lands.")]
+    public float filmRate = 1.0f;
+
+    [Range(0f, 1f)]
+    [Tooltip("How bouncy paint is on the surface. 0 = it splats and sticks (realistic paint); 1 = fully elastic (marble balls). Keep low.")]
+    public float bounce = 0.1f;
+
+    [Tooltip("Evaporation rate for paint spread ON a surface (a thin film dries much faster than bulk). Scaled by EnvironmentConfig temperature/humidity. This is what makes non-absorbent steel still set in a few seconds. Higher = dries/sets sooner.")]
+    public float contactDryRate = 1.5f;
 
     [Tooltip("Scales friction into a per-second tangential damping.")]
     public float frictionRate = 12f;
 
     [Tooltip("How fast a fresh (wet) paint layer dries and 'commits' so later paint covers it instead of blending. Also scaled by the EnvironmentConfig temperature/humidity and the surface absorbency. Higher = paints over sooner.")]
     public float layerDryRate = 0.6f;
+
+    [Tooltip("Strength of the solid mark a particle leaves when it DRIES onto the surface (any surface — this is what makes dried steel/wood paint show in the artwork and RIDE the canvas when it moves). Scaled a bit by adhesion. Higher = bolder dried marks.")]
+    public float driedMarkStrength = 1.5f;
 
     [Header("Export (save the finished artwork as a PNG)")]
     [Tooltip("Press this key at run time to save the canvas as a PNG. None = disabled (still exportable from the component's right-click menu).")]
@@ -229,8 +239,9 @@ public class PaintCanvas : MonoBehaviour
                 absorbency = 0.40f; wettability = 0.55f; adhesion = 0.55f; friction = 0.55f;
                 baseColor = new Color(0.72f, 0.55f, 0.35f);
                 break;
-            case SurfaceType.Steel: // non-porous, non-wetting: paint beads, slides, barely marks
-                absorbency = 0.02f; wettability = 0.10f; adhesion = 0.10f; friction = 0.15f;
+            case SurfaceType.Steel: // non-porous but paint still WETS it: sticks as a film on top,
+                // soaks in nothing, dries by evaporation, marks moderately (weaker/removable than canvas)
+                absorbency = 0.02f; wettability = 0.60f; adhesion = 0.35f; friction = 0.45f;
                 baseColor = new Color(0.55f, 0.57f, 0.60f);
                 break;
         }

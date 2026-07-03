@@ -40,7 +40,8 @@ patch fills up and then bleeds/pools — Washburn's `√t` slow-down — with no
 Each `PaintCanvas` carries four physically-named coefficients (0–1), set by a `SurfaceType` preset:
 
 - **`absorbency`** — porosity / permeability `k` (Darcy). How readily paint soaks *in*.
-- **`wettability`** — contact angle θ (Young). High = wets & spreads & develops suction; low = beads.
+- **`wettability`** — contact angle θ (Young). High = wets, spreads & develops capillary suction;
+  low = spreads less (paint still sticks — it no longer *beads/bounces* in this model).
 - **`adhesion`** — surface energy. A thin **film** that grips/stains even when nothing is absorbed.
 - **`friction`** — roughness. Tangential grip that stops the paint sliding across the surface.
 
@@ -48,14 +49,17 @@ Each `PaintCanvas` carries four physically-named coefficients (0–1), set by a 
 
 | Surface | absorbency | wettability | adhesion | friction | behaviour |
 |---|---|---|---|---|---|
-| **Canvas** | 0.70 | 0.85 | 0.85 | 0.70 | soaks, spreads, grips, stains strongly |
+| **Canvas** | 0.70 | 0.85 | 0.85 | 0.70 | soaks in, spreads, grips, stains strongly |
 | **Paper**  | 0.95 | 0.90 | 0.65 | 0.55 | soaks fastest, strong mark, saturates/bleeds |
 | **Wood**   | 0.40 | 0.55 | 0.55 | 0.55 | partial soak, medium grip |
-| **Steel**  | 0.02 | 0.10 | 0.10 | 0.15 | repels — paint beads, slides, barely marks, dries on top |
+| **Steel**  | 0.02 | 0.60 | 0.35 | 0.45 | no soak — paint sticks as a film on top, dries by evaporation, marks moderately (weaker/removable) |
 
-Steel is the honest limiting case: `wettability 0.1 → cosθ ≈ −0.8`, so it develops **no** capillary
-suction (`wetting = saturate(cosθ) = 0`), keeps its **bounce** (beads), and with `absorbency ≈ 0` and
-`adhesion ≈ 0` leaves almost no stain. Paper is the opposite corner and will saturate then bleed.
+**Paint wets and sticks to every surface** — it's viscous paint, not water on Teflon. So paint
+*splats and clings* on contact everywhere (see *Impact* below); surfaces differ by how much they
+**absorb**, how strongly they **stain**, and how fast they **dry**, not by whether paint bounces off.
+Steel is the low-absorbency case: `absorbency ≈ 0` so it soaks in ~nothing (paint stays a film on
+top), it dries only by **evaporation** (contact-drying), and its lower `adhesion` leaves a moderate,
+more *removable* mark. Paper is the opposite corner — soaks fastest and saturates/bleeds.
 
 ---
 
@@ -70,26 +74,34 @@ the in-bucket paint is still held by the walls above).
    Outside the quad footprint → the drip misses and keeps falling. Only act within a thin contact band
    around the surface.
 2. **Contact angle (Young).** `cosTheta = 2·wettability − 1`; `wetting = saturate(cosTheta)`.
-3. **Impact (restitution).** Put the particle on the surface; the normal bounce is
-   `collisionDamping·(1 − wetting)` — a wetting surface kills the bounce (paint sticks flat), a
-   non-wetting one keeps it (beads). Roughness damps the tangential velocity (friction).
+3. **Impact — splat & stick.** Put the particle on the surface. Paint barely bounces (it's viscous):
+   the normal restitution is a small global `canvasBounce·(1 − wetting)`, so it splats and clings on
+   *any* surface — no marble-ball skittering off steel. Roughness damps the tangential velocity
+   (friction) so it doesn't slide off.
 4. **Capillary absorption (Young–Laplace → Darcy → Washburn).** Read how saturated this texel already
    is (`localSat`), compute the suction `capPressure = canvasCapillary·wetting`, then the Darcy flux
    `absorbency·capPressure·viscFactor / (1 + saturationChoke·localSat)` where
    `viscFactor = 1/(1 + viscousDrag·effectiveViscosity)`. Subtract the absorbed liquid from the
    particle's **wetness** (reusing the drying field: liquid given up to the substrate = paint that
-   sets).
+   sets). Then apply **contact-drying (evaporation)**: `wetness −= contactDryRate·(temp/40)·(1−humidity)·dt`
+   — paint spread thin on a surface evaporates far faster than bulk, so even non-absorbent **steel
+   sets in a few seconds** (then it stamps its dried mark and adheres). Canvas/paper dry by absorption
+   *and* this; steel by evaporation only.
 5. **Stain (deposit).** Add pigment to the canvas's **wet layer**: `absorbed` (what soaked in) plus a
    thin `adhesion·wetness·filmRate` film that grips on top even on non-absorbing surfaces. Dry paint
    adds nothing new, so a mark stops darkening once it has set; steel barely marks. The colour
    deposited is the particle's **displayed** colour — its mix fraction `t` through the same spectral
    Kubelka–Munk LUT the particles render with (see [`ColorMixing.md`](ColorMixing.md)), so the artwork
    matches the paint. (See *Layering* below for the wet/dry split.)
-6. **Soak in or bead.** Once set (`wetness ≤ setWetnessThreshold`): on a **porous** surface
-   (`absorbency > 0.25`, i.e. canvas/paper/wood) the drop has soaked in — it's flagged `Absorbed`,
-   removed from the sim and **hidden**, so no pile of spheres builds up (its pigment is already in the
-   deposit map). On **steel** (`absorbency ≈ 0`) it can't soak in: it stays as a dried **bead on top**,
-   pinned in the canvas frame by adhesion so it rides with a moving canvas.
+6. **Dry & adhere (any surface).** Once the paint dries in contact (`wetness ≤ setWetnessThreshold`)
+   it leaves a **solid mark** of its colour on *any* surface (a bit lighter on low-adhesion surfaces
+   like steel, scaled by `driedMarkStrength·(0.4 + 0.6·adhesion)`), and the particle is then flagged
+   `Absorbed` — removed from the sim and hidden. Its colour now lives in the **deposit map**, which is
+   stored in the canvas's **local** frame and drawn at the canvas transform, so the dried mark
+   **rides the canvas** when it moves/tilts. **That is the adhesion** — dried paint travels with the
+   surface. Still-**wet** paint that hasn't set slides off a moving surface (correct — it isn't stuck
+   yet). This is also what makes dried **steel/wood** paint show up in the artwork/screenshot instead
+   of only existing as loose 3D particles.
 
 ### The deposit map (the artwork)
 
