@@ -141,6 +141,17 @@ public class FluidSimGPU : MonoBehaviour
     [Header("Rendering")]
     public float particleScale = 0.2f;
 
+    public enum RenderMode
+    {
+        Balls, // the original per-particle shaded spheres
+        Surface, // screen-space fluid surface (needs a FluidSurfaceRenderer on the camera — Phase 6)
+    }
+
+    [Tooltip(
+        "Balls = draw each particle as a sphere (default). Surface = let a FluidSurfaceRenderer on the camera render the paint as a continuous fluid surface (this component then skips the spheres)."
+    )]
+    public RenderMode renderMode = RenderMode.Balls;
+
     // --- GPU buffers ---
     ComputeBuffer positionsBuf,
         predictedBuf,
@@ -861,6 +872,10 @@ public class FluidSimGPU : MonoBehaviour
 
     void RenderParticles()
     {
+        // In Surface mode the FluidSurfaceRenderer (on the camera) draws the fluid instead — skip the
+        // spheres so they don't render on top of / behind the surface.
+        if (renderMode == RenderMode.Surface)
+            return;
         if (numParticles < 2 || particleMaterial == null)
             return;
 
@@ -874,6 +889,18 @@ public class FluidSimGPU : MonoBehaviour
         var rp = new RenderParams(particleMaterial) { worldBounds = drawBounds };
         Graphics.RenderMeshPrimitives(rp, particleMesh, 0, numParticles);
     }
+
+    // --- Public read-only accessors for the screen-space FluidSurfaceRenderer (Phase 6). It reuses
+    // these existing buffers directly — no extra sim state. Valid once the buffers are allocated. ---
+    public ComputeBuffer PositionsBuffer => positionsBuf;
+    public ComputeBuffer ColorsBuffer => colorsBuf; // .x = mix fraction t
+    public ComputeBuffer MixLutBuffer => mixLutBuf; // t -> spectral paint colour
+    public ComputeBuffer AbsorbedBuffer => absorbedBuf; // 1 = soaked in (hide)
+    public ComputeBuffer WetnessBuffer => wetnessBuf; // 1 = wet (glossy) -> 0 = dry (matte)
+    public int MixLutCount => MixLutSize;
+    public int ActiveParticleCount => positionsBuf != null ? numParticles : 0;
+    public float ParticleWorldRadius => particleScale * 0.5f; // sphere mesh radius 0.5 × scale
+    public bool RenderAsSurface => renderMode == RenderMode.Surface;
 
     // Low-poly UV sphere (radius 0.5) — same as the CPU version.
     Mesh CreateSphereMesh(int sectors, int rings)

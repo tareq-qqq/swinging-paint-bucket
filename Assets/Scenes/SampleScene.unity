@@ -344,7 +344,7 @@ MonoBehaviour:
   dryingRate: 0.05
   setWetnessThreshold: 0.15
   airExposureThreshold: 0.95
-  enableAirEffects: 0
+  enableAirEffects: 1
   boundsSize: {x: 10, y: 10, z: 10}
   container: {fileID: 646856881}
   boundsVisual: {fileID: 0}
@@ -358,6 +358,7 @@ MonoBehaviour:
   colorMixRate: 1
   shakeMixBoost: 0.5
   particleScale: 0.13
+  renderMode: 1
 --- !u!4 &646856880
 Transform:
   m_ObjectHideFlags: 0
@@ -546,6 +547,7 @@ GameObject:
   - component: {fileID: 963194228}
   - component: {fileID: 963194227}
   - component: {fileID: 963194226}
+  - component: {fileID: 963194229}
   m_Layer: 0
   m_Name: Main Camera
   m_TagString: MainCamera
@@ -620,13 +622,36 @@ Transform:
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 963194225}
   serializedVersion: 2
-  m_LocalRotation: {x: 0.13686372, y: -0, z: -0, w: 0.99058986}
-  m_LocalPosition: {x: 0, y: 7, z: -14.18}
+  m_LocalRotation: {x: 0.31569442, y: -0, z: -0, w: 0.94886094}
+  m_LocalPosition: {x: 0, y: 10.8, z: -19.26}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
   m_Children: []
   m_Father: {fileID: 0}
-  m_LocalEulerAnglesHint: {x: 15.733, y: 0, z: 0}
+  m_LocalEulerAnglesHint: {x: 36.805, y: 0, z: 0}
+--- !u!114 &963194229
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 963194225}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 664a9d6ee2e244d4ae953574c81e42ac, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: Assembly-CSharp::FluidSurfaceRenderer
+  sim: {fileID: 646856879}
+  radiusScale: 1.5
+  blurRadius: 12
+  blurDepthFalloff: 8
+  blurIterations: 1
+  lightDirection: {x: 0.4, y: 1, z: 0.3}
+  ambient: 0.35
+  glossStrength: 0.6
+  glossPower: 48
+  fresnelStrength: 0.3
+  debugSceneOnly: 1
 --- !u!1 &1059329503
 GameObject:
   m_ObjectHideFlags: 0
@@ -675,8 +700,11 @@ MonoBehaviour:
   viscousDrag: 2
   saturationChoke: 6
   filmRate: 0.4
+  bounce: 0.1
+  contactDryRate: 1.5
   frictionRate: 12
   layerDryRate: 0.6
+  driedMarkStrength: 1.5
   exportKey: 30
   saveFolder: 
 --- !u!4 &1059329505
@@ -967,6 +995,7 @@ MonoBehaviour:
   colorMixRate: 1
   shakeMixBoost: 0.5
   particleScale: 0.2
+  renderMode: 0
 --- !u!4 &1304441045
 Transform:
   m_ObjectHideFlags: 0
