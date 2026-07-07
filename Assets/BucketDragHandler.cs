@@ -65,6 +65,14 @@ public class BucketDragHandler : MonoBehaviour
             Debug.LogWarning("[BucketDragHandler] No camera found — can't drag the bucket.");
     }
 
+    // Set from the setup UI (SimulationBootstrapper).
+    public void Configure(float grabRadius, float turnSpeed, float throwStr)
+    {
+        grabPixelRadius = grabRadius;
+        maxDegreesPerFrame = turnSpeed;
+        throwStrength = throwStr;
+    }
+
     void Update()
     {
         if (pendulum == null || bucket == null || cam == null)

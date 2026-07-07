@@ -36,6 +36,16 @@ public class BucketSystem : MonoBehaviour
     public float FloorY => bucketFloorY;
     public float HoleRadius => holeRadius;
 
+    // Set from the setup UI (SimulationBootstrapper) before the sim starts. Floor tracks the height.
+    public void Configure(float mass, float radius, float height, float hole)
+    {
+        bucketMass = mass;
+        bucketRadius = radius;
+        bucketHeight = height;
+        bucketFloorY = -height * 0.5f;
+        holeRadius = hole;
+    }
+
     void Start() { }
 
     void FixedUpdate()

@@ -127,4 +127,13 @@ public class PendulumPhysics : MonoBehaviour
         thetaDot = kickTheta;
         phiDot = kickPhi;
     }
+
+    // Set the initial swing (angle / speed / direction) from the setup UI, before the sim starts.
+    public void ConfigureInitial(float theta, float thetaDot, float phi, float phiDot)
+    {
+        initialTheta = theta;
+        initialThetaDot = thetaDot;
+        initialPhi = phi;
+        initialPhiDot = phiDot;
+    }
 }

@@ -45,6 +45,13 @@ public class BucketContainer : MonoBehaviour
     public float HoleRadius => bucket.HoleRadius;
     public bool OpenTop => openTop;
 
+    // Set from the setup UI (SimulationBootstrapper) before the paint spawns.
+    public void Configure(bool open, float fill)
+    {
+        openTop = open;
+        fillFraction = Mathf.Clamp01(fill);
+    }
+
     // How many particles fill 100% of the bucket at this spacing (≈ volume / spacing³).
     public int Capacity(float spacing)
     {

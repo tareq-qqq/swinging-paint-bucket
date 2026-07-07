@@ -72,4 +72,15 @@ public class SimulationController : MonoBehaviour
     {
         pendulum?.ApplyInitialKick(kickThetaStrength, kickPhiStrength);
     }
+
+    // Set from the setup UI (SimulationBootstrapper) before the sim starts.
+    public void Configure(Vector3 pivot, float kickTheta, float kickPhi)
+    {
+        pivotWorldPos = pivot;
+        kickThetaStrength = kickTheta;
+        kickPhiStrength = kickPhi;
+    }
+
+    public void SetMaterialIndex(int i) =>
+        SetMaterial((RopeSystem.RopeMaterial)Mathf.Clamp(i, 0, 3));
 }

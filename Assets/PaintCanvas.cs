@@ -248,6 +248,13 @@ public class PaintCanvas : MonoBehaviour
         lastAppliedPreset = type;
     }
 
+    // Set from the setup UI (SimulationBootstrapper): pick the surface type and apply its preset.
+    public void SetSurfaceType(int type)
+    {
+        surfaceType = (SurfaceType)Mathf.Clamp(type, 0, 3);
+        ApplyPreset(surfaceType);
+    }
+
     void RebuildQuad()
     {
         if (quadMesh == null)

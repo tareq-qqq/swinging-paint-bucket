@@ -179,6 +179,12 @@ public class RopeSystem : MonoBehaviour
         material = m;
     }
 
+    // Set from the setup UI (SimulationBootstrapper) before the rope initialises.
+    public void SetRestLength(float length)
+    {
+        restLength = Mathf.Max(0.1f, length);
+    }
+
     public string MaterialLabel => ActiveMaterial.label;
 
 #if UNITY_EDITOR
