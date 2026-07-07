@@ -86,6 +86,22 @@ public class PendulumPhysics : MonoBehaviour
                 phiDotDot = (-b * phiDot - 2f * sinT * cosT * thetaDot * phiDot) / sin2T;
             }
 
+            //  WIND — the same EnvironmentConfig wind that pushes the paint also pushes the bucket.
+            //  Project the world-space wind FORCE onto the swing coordinates (θ, φ) using the bob's
+            //  position derivatives; dividing by mass means a heavier bucket resists the wind more.
+            //  bob dir u = (sinθcosφ, -cosθ, sinθsinφ):  ∂u/∂θ = (cosθcosφ, sinθ, cosθsinφ),
+            //  ∂u/∂φ = (-sinθsinφ, 0, sinθcosφ).
+            Vector3 wind = env != null ? env.wind : Vector3.zero;
+            if (wind != Vector3.zero)
+            {
+                float cosPhi = Mathf.Cos(phi);
+                float sinPhi = Mathf.Sin(phi);
+                float mL = Mathf.Max(0.05f, m) * L;
+                thetaDotDot += (wind.x * cosT * cosPhi + wind.y * sinT + wind.z * cosT * sinPhi) / mL;
+                if (sin2T > 0.01f)
+                    phiDotDot += (wind.z * cosPhi - wind.x * sinPhi) / (mL * sinT);
+            }
+
             thetaDot += thetaDotDot * dt;
             theta += thetaDot * dt;
             phiDot += phiDotDot * dt;
